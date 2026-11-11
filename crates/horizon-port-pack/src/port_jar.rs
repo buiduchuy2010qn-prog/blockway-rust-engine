@@ -932,7 +932,10 @@ fn write_upgraded_datapack(
 
     for i in 0..zip.len() {
         let entry = zip.by_index(i).map_err(|e| e.to_string())?;
-        let raw_name = entry.name().replace('\\', "/");
+        let Ok(name) = entry.name() else {
+            continue;
+        };
+        let raw_name = name.replace('\\', "/");
         if raw_name.ends_with('/') {
             continue;
         }
@@ -1033,7 +1036,10 @@ fn write_vanilla_resourcepack(
 
     for i in 0..zip.len() {
         let entry = zip.by_index(i).map_err(|e| e.to_string())?;
-        let raw_name = entry.name().replace('\\', "/");
+        let Ok(name) = entry.name() else {
+            continue;
+        };
+        let raw_name = name.replace('\\', "/");
         if raw_name.ends_with('/') {
             continue;
         }
@@ -2026,7 +2032,10 @@ fn extract_pack_overrides_from_zip(pack_zip: &Path, game_dir: &Path) -> Result<u
 
     for i in 0..zip.len() {
         let entry = zip.by_index(i).map_err(|e| e.to_string())?;
-        let raw_name = entry.name().replace('\\', "/");
+        let Ok(name) = entry.name() else {
+            continue;
+        };
+        let raw_name = name.replace('\\', "/");
         if raw_name.ends_with('/') {
             continue;
         }
