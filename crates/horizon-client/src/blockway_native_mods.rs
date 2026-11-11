@@ -823,12 +823,13 @@ mod tests {
     use super::*;
     use crate::mod_api::{NativeClientState, NativeScreenKind};
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
 
     #[derive(Default)]
     struct MockHost {
         playing: bool,
         enabled: BTreeMap<String, bool>,
-        settings: BTreeMap<(String, String), String>,
+        settings: Mutex<BTreeMap<(String, String), String>>,
     }
 
     impl Host for MockHost {
@@ -840,25 +841,25 @@ mod tests {
         }
         fn setting(&self, mod_id: &str, key: &str) -> Option<String> {
             self.settings
+                .lock()
+                .expect("settings lock")
                 .get(&(mod_id.to_owned(), key.to_owned()))
                 .cloned()
         }
-        fn set_setting(&mut self, mod_id: &str, key: &str, value: &str) {
-            self.settings.insert(
-                (mod_id.to_owned(), key.to_owned()),
-                value.to_owned(),
-            );
+        fn set_setting(&self, mod_id: &str, key: &str, value: &str) {
+            self.settings
+                .lock()
+                .expect("settings lock")
+                .insert((mod_id.to_owned(), key.to_owned()), value.to_owned());
         }
         fn mod_key(&self, _mod_id: &str, _name: &str, default: &str) -> String {
             default.to_owned()
         }
         fn client_state(&self) -> Option<NativeClientState> {
-            Some(NativeClientState {
-                debug_screen: false,
-                gui_hidden: false,
-                screen: NativeScreenKind::None,
-                focused: true,
-            })
+            let mut st = NativeClientState::default();
+            st.focused = true;
+            st.screen = NativeScreenKind::Playing;
+            Some(st)
         }
     }
 
