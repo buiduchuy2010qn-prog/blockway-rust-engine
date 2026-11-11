@@ -1,0 +1,137 @@
+name: Build & Publish BlockWay Rust Core
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: blockway-rust-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows-x64:
+    name: Build Windows x64 Multi-Version Rust Engine
+    runs-on: windows-latest
+    timeout-minutes: 55
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+      HORIZON_VERSION: blockway-rust-1.0
+      CARGO_TERM_COLOR: always
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: blockway-rust-win-x64
+
+      - name: Verify multi-version profile unit tests
+        run: |
+          set -euo pipefail
+          cargo test --locked -p horizon-core --lib version_profile
+
+      - name: Build native Rust binaries (horizon-client, horizon-ctl, horizon-prepare, horizon-server)
+        run: |
+          set -euo pipefail
+          cargo build --release --locked \
+            -p horizon-official --bin horizon-official \
+            -p horizon-client-lib --bin horizon-ctl \
+            -p horizon-prepare --bin horizon-prepare \
+            -p horizon-server --bin horizon-server
+          cp -f target/release/horizon-official.exe target/release/horizon-client.exe
+
+      - name: Smoke-test native multi-version CLI (--mc-version)
+        run: |
+          set -euo pipefail
+          target/release/horizon-client.exe --help | grep -q -- '--mc-version'
+          target/release/horizon-client.exe --mc-version 1.21.11 --launch-api | grep -q '"minecraft": "1.21.11"'
+          target/release/horizon-client.exe --mc-version 1.21.1 --launch-api | grep -q '"minecraft": "1.21.1"'
+          target/release/horizon-client.exe --mc-version 26.3 --launch-api | grep -q '"engine": "blockway-rust"'
+          python tools/check_pe_arch.py x64 \
+            target/release/horizon-client.exe \
+            target/release/horizon-ctl.exe \
+            target/release/horizon-prepare.exe \
+            target/release/horizon-server.exe
+
+      - name: Package horizon-windows-x64 release archive
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- package target/release/horizon-client.exe dist/horizon-windows-x64
+          python tools/ci/fetch_dxc.py dist/horizon-windows-x64
+          export SHORT_SHA="${GITHUB_SHA:0:7}"
+          export BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python - <<'PY'
+          import json, os, pathlib
+          out_dir = pathlib.Path("dist/horizon-windows-x64")
+          meta = {
+              "engine": "blockway-rust",
+              "version": "1.0.0",
+              "commit": os.environ["GITHUB_SHA"],
+              "shortCommit": os.environ["SHORT_SHA"],
+              "builtAt": os.environ["BUILT_AT"],
+              "nativeMultiVersion": True,
+              "cliFlag": "--mc-version"
+          }
+          (out_dir / "blockway-rust-build.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+          PY
+          cd dist
+          rm -f horizon-windows-x64.zip
+          7z a -tzip horizon-windows-x64.zip horizon-windows-x64 > /dev/null
+          sha256sum horizon-windows-x64.zip > sha256sums.txt
+          python - <<'PY'
+          import hashlib, json, os, pathlib
+          z = pathlib.Path("horizon-windows-x64.zip")
+          digest = hashlib.sha256(z.read_bytes()).hexdigest()
+          repo = os.environ["GITHUB_REPOSITORY"]
+          manifest = {
+              "engine": "blockway-rust",
+              "tag": "latest",
+              "commit": os.environ["GITHUB_SHA"],
+              "shortCommit": os.environ["SHORT_SHA"],
+              "builtAt": os.environ["BUILT_AT"],
+              "sizeBytes": z.stat().st_size,
+              "sha256": digest,
+              "downloadUrl": f"https://github.com/{repo}/releases/download/latest/horizon-windows-x64.zip",
+              "nativeMultiVersion": True
+          }
+          pathlib.Path("blockway-rust-manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+          PY
+          ls -lh horizon-windows-x64.zip blockway-rust-manifest.json sha256sums.txt
+
+      - name: Publish rolling Release (`latest`) for BlockWay Launcher OTA Core Upgrade
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          NOTES="🦀 **BlockWay Multi-Version Rust Engine** (\`${SHORT_SHA}\`) — 100% Native Rust (\`--mc-version 1.16.5..26.3\`, Vulkan + DirectX 12, zero binary patching)."
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest \
+              dist/horizon-windows-x64.zip \
+              dist/blockway-rust-manifest.json \
+              dist/sha256sums.txt \
+              --clobber
+            gh release edit latest --title "BlockWay Rust Core (${SHORT_SHA})" --notes "$NOTES" --latest
+          else
+            gh release create latest \
+              dist/horizon-windows-x64.zip \
+              dist/blockway-rust-manifest.json \
+              dist/sha256sums.txt \
+              --title "BlockWay Rust Core (${SHORT_SHA})" \
+              --notes "$NOTES" \
+              --latest
+          fi
