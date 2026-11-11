@@ -39,33 +39,38 @@ jobs:
         with:
           shared-key: blockway-rust-win-x64
 
-      - name: Verify multi-version profile unit tests
+      - name: Verify multi-version profile & jar-to-hmod unit tests
         run: |
           set -euo pipefail
           cargo test --locked -p horizon-core --lib version_profile
+          cargo test --locked -p horizon-port-pack --lib port_jar
 
-      - name: Build native Rust binaries (horizon-client, horizon-ctl, horizon-prepare, horizon-server)
+      - name: Build native Rust binaries (horizon-client, horizon-ctl, horizon-prepare, horizon-server, horizon-port-jar)
         run: |
           set -euo pipefail
           cargo build --release --locked \
             -p horizon-official --bin horizon-official \
             -p horizon-client-lib --bin horizon-ctl \
             -p horizon-prepare --bin horizon-prepare \
-            -p horizon-server --bin horizon-server
+            -p horizon-server --bin horizon-server \
+            -p horizon-port-pack --bin horizon-port-jar
           cp -f target/release/horizon-official.exe target/release/horizon-client.exe
 
-      - name: Smoke-test native multi-version CLI (--mc-version)
+      - name: Smoke-test native multi-version CLI & horizon-port-jar
         run: |
           set -euo pipefail
           target/release/horizon-client.exe --help | grep -q -- '--mc-version'
           target/release/horizon-client.exe --mc-version 1.21.11 --launch-api | grep -q '"minecraft": "1.21.11"'
           target/release/horizon-client.exe --mc-version 1.21.1 --launch-api | grep -q '"minecraft": "1.21.1"'
           target/release/horizon-client.exe --mc-version 26.3 --launch-api | grep -q '"engine": "blockway-rust"'
+          target/release/horizon-port-jar.exe --version | grep -q 'horizon-port-jar'
+          target/release/horizon-port-jar.exe --help | grep -q 'scan-dir'
           python tools/check_pe_arch.py x64 \
             target/release/horizon-client.exe \
             target/release/horizon-ctl.exe \
             target/release/horizon-prepare.exe \
-            target/release/horizon-server.exe
+            target/release/horizon-server.exe \
+            target/release/horizon-port-jar.exe
 
       - name: Package horizon-windows-x64 release archive
         run: |
@@ -84,6 +89,7 @@ jobs:
               "shortCommit": os.environ["SHORT_SHA"],
               "builtAt": os.environ["BUILT_AT"],
               "nativeMultiVersion": True,
+              "hasPortJar": True,
               "cliFlag": "--mc-version"
           }
           (out_dir / "blockway-rust-build.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -106,7 +112,8 @@ jobs:
               "sizeBytes": z.stat().st_size,
               "sha256": digest,
               "downloadUrl": f"https://github.com/{repo}/releases/download/latest/horizon-windows-x64.zip",
-              "nativeMultiVersion": True
+              "nativeMultiVersion": True,
+              "hasPortJar": True
           }
           pathlib.Path("blockway-rust-manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
           PY

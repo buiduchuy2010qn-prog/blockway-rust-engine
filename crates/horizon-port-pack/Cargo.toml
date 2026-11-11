@@ -6,6 +6,14 @@ license.workspace = true
 rust-version.workspace = true
 description = "Port a Java modpack to Horizon: import, inventory, classification and data carry-over (docs/modpacks.md)"
 
+[[bin]]
+name = "horizon-port-pack"
+path = "src/main.rs"
+
+[[bin]]
+name = "horizon-port-jar"
+path = "src/bin/horizon-port-jar.rs"
+
 [dependencies]
 # Content path rules only (no runtime): what the game's content loader accepts.
 horizon-mods = { path = "../horizon-mods", default-features = false }
