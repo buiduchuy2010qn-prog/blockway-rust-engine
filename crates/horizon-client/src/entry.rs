@@ -3,7 +3,8 @@ use crate::{crash, game, logging};
 
 /// Start the game. The executable supplies the allocator and retains the mod API marker.
 pub fn main() {
-    main_with(Default::default());
+    crate::mod_api::name_mods(&crate::blockway_native_mods::MOD_IDS);
+    main_with(crate::blockway_native_mods::mods());
 }
 
 /// Start the game with trait mods in dispatch order.

@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 extern crate self as horizon_client;
 pub use horizon_client_lib::*;
+pub mod blockway_native_mods;
 pub mod entry;
 pub mod game;
 mod horizon_look;

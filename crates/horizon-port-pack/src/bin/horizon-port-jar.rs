@@ -1,28 +1,36 @@
-//! `horizon-port-jar`: Native Rust `.jar` -> `.hmod` mod converter and `.hmod`
-//! package manager for BlockWay Rust / Horizon Engine.
+//! `horizon-port-jar`: Multi-channel Native Rust Mod & Modpack converter and
+//! manager for BlockWay Rust / Horizon Engine.
 //!
 //! Commands:
-//! - `convert --out-dir <horizon-mods> [--mods-txt <horizon-mods.txt>] [--resources <26.3>] [--enable] [--json] [--jar <file.jar>...] [<file.jar>...]`
-//! - `scan-dir --mods-dir <mods> --out-dir <horizon-mods> [--mods-txt <horizon-mods.txt>] [--resources <26.3>] [--enable] [--json]`
-//! - `list --out-dir <horizon-mods> [--mods-txt <horizon-mods.txt>] [--json]`
+//! - `convert --out-dir <horizon-mods> [--game-dir <game>] [--mods-txt <horizon-mods.txt>] [--resources <26.3>] [--enable] [--json] [--jar <file>...] [<file>...]`
+//! - `scan-dir --mods-dir <mods> --out-dir <horizon-mods> [--game-dir <game>] [--mods-txt <horizon-mods.txt>] [--resources <26.3>] [--enable] [--json]`
+//! - `port-pack --pack <dir_or_mrpack_or_zip> --game-dir <game> [--resources <26.3>] [--enable] [--json]`
+//! - `list --out-dir <horizon-mods> [--game-dir <game>] [--mods-txt <horizon-mods.txt>] [--json]`
 //! - `toggle --mods-txt <horizon-mods.txt> [--out-dir <horizon-mods>] --id <mod_id> (--enable | --disable) [--json]`
 use horizon_port_pack::{
     check::Verdict,
-    port_jar::{PortedMod, list_installed_hmods, port_jar_to_hmod, set_mod_enabled},
+    port_jar::{
+        InstalledDatapack, InstalledHmod, InstalledResourcePack, ModpackPortReport,
+        NativeModStatus, PortedMod, list_installed_datapacks, list_installed_hmods,
+        list_native_mods, list_ported_resourcepacks, port_jar_with_game_dir, port_modpack,
+        set_mod_enabled,
+    },
 };
 use serde::Serialize;
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::ExitCode,
 };
 
-const VERSION: &str = "horizon-port-jar 1.0.0 (blockway-rust)";
+const VERSION: &str = "horizon-port-jar 2.0.0 (blockway-rust)";
 const USAGE: &str = "\
 usage:
-  horizon-port-jar convert --out-dir <horizon-mods> [--mods-txt <horizon-mods.txt>] [--resources <prepared-26.3>] [--enable] [--json] [--jar <file.jar>...] [<file.jar>...]
-  horizon-port-jar scan-dir --mods-dir <java-mods> --out-dir <horizon-mods> [--mods-txt <horizon-mods.txt>] [--resources <prepared-26.3>] [--enable] [--json]
-  horizon-port-jar list --out-dir <horizon-mods> [--mods-txt <horizon-mods.txt>] [--json]
+  horizon-port-jar convert --out-dir <horizon-mods> [--game-dir <game>] [--mods-txt <horizon-mods.txt>] [--resources <prepared-26.3>] [--enable] [--json] [--jar <file.jar|zip>...] [<file.jar|zip>...]
+  horizon-port-jar scan-dir --mods-dir <java-mods> --out-dir <horizon-mods> [--game-dir <game>] [--mods-txt <horizon-mods.txt>] [--resources <prepared-26.3>] [--enable] [--json]
+  horizon-port-jar port-pack --pack <dir_or_mrpack_or_zip> --game-dir <game> [--resources <prepared-26.3>] [--enable] [--json]
+  horizon-port-jar list --out-dir <horizon-mods> [--game-dir <game>] [--mods-txt <horizon-mods.txt>] [--json]
   horizon-port-jar toggle --mods-txt <horizon-mods.txt> [--out-dir <horizon-mods>] --id <mod_id> (--enable | --disable) [--json]";
 
 #[derive(Serialize)]
@@ -35,6 +43,11 @@ struct ConvertOutput {
     works: usize,
     partly: usize,
     skipped_code_only: usize,
+    hmods_created: usize,
+    datapacks_created: usize,
+    resourcepacks_created: usize,
+    native_rust_enabled: usize,
+    builtin_engine_matched: usize,
     results: Vec<PortedMod>,
 }
 
@@ -43,7 +56,10 @@ struct ListOutput {
     ok: bool,
     engine: &'static str,
     mode: &'static str,
-    mods: Vec<horizon_port_pack::port_jar::InstalledHmod>,
+    mods: Vec<InstalledHmod>,
+    native_mods: Vec<NativeModStatus>,
+    datapacks: Vec<InstalledDatapack>,
+    resourcepacks: Vec<InstalledResourcePack>,
 }
 
 #[derive(Serialize)]
@@ -54,6 +70,15 @@ struct ToggleOutput {
     id: String,
     enabled: bool,
     clash: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PortPackOutput {
+    ok: bool,
+    engine: &'static str,
+    mode: &'static str,
+    #[serde(flatten)]
+    report: ModpackPortReport,
 }
 
 fn main() -> ExitCode {
@@ -91,9 +116,11 @@ fn run(mut args: Vec<String>, json_mode: bool) -> Result<(), String> {
     let enable = take_flag(&mut args, "--enable");
     let disable = take_flag(&mut args, "--disable");
     let out_dir = take_option(&mut args, "--out-dir")?.map(PathBuf::from);
+    let game_dir = take_option(&mut args, "--game-dir")?.map(PathBuf::from);
     let mods_dir = take_option(&mut args, "--mods-dir")?.map(PathBuf::from);
     let mods_txt = take_option(&mut args, "--mods-txt")?.map(PathBuf::from);
     let resources = take_option(&mut args, "--resources")?.map(PathBuf::from);
+    let pack_path = take_option(&mut args, "--pack")?.map(PathBuf::from);
     let mod_id = take_option(&mut args, "--id")?;
     let mut explicit_jars: Vec<PathBuf> = Vec::new();
     while let Some(j) = take_option(&mut args, "--jar")? {
@@ -106,7 +133,15 @@ fn run(mut args: Vec<String>, json_mode: bool) -> Result<(), String> {
 
     match cmd.as_str() {
         "convert" => {
-            let out_dir = out_dir.ok_or_else(|| "missing --out-dir <horizon-mods>".to_owned())?;
+            let out_dir = out_dir
+                .or_else(|| game_dir.as_ref().map(|g| g.join("horizon-mods")))
+                .ok_or_else(|| "missing --out-dir <horizon-mods>".to_owned())?;
+            let resolved_game_dir = game_dir.or_else(|| out_dir.parent().map(Path::to_path_buf));
+            let resolved_mods_txt = mods_txt.or_else(|| {
+                resolved_game_dir
+                    .as_ref()
+                    .map(|g| g.join("horizon-mods.txt"))
+            });
             for positional in args.into_iter().skip(1) {
                 if positional.starts_with('-') {
                     return Err(format!("unknown flag {positional}\n{USAGE}"));
@@ -114,13 +149,14 @@ fn run(mut args: Vec<String>, json_mode: bool) -> Result<(), String> {
                 explicit_jars.push(PathBuf::from(positional));
             }
             if explicit_jars.is_empty() {
-                return Err("no .jar files specified for convert".into());
+                return Err("no .jar/.zip files specified for convert".into());
             }
             run_batch_convert(
                 "convert",
                 &explicit_jars,
                 &out_dir,
-                mods_txt.as_deref(),
+                resolved_game_dir.as_deref(),
+                resolved_mods_txt.as_deref(),
                 resources.as_deref(),
                 enable,
                 json_mode,
@@ -128,57 +164,151 @@ fn run(mut args: Vec<String>, json_mode: bool) -> Result<(), String> {
         }
         "scan-dir" => {
             let mods_dir = mods_dir.ok_or_else(|| "missing --mods-dir <java-mods>".to_owned())?;
-            let out_dir = out_dir.ok_or_else(|| "missing --out-dir <horizon-mods>".to_owned())?;
-            let mut jars = Vec::new();
-            if mods_dir.is_dir() {
-                let entries = fs::read_dir(&mods_dir)
-                    .map_err(|e| format!("{}: {e}", mods_dir.display()))?;
+            let out_dir = out_dir
+                .or_else(|| game_dir.as_ref().map(|g| g.join("horizon-mods")))
+                .ok_or_else(|| "missing --out-dir <horizon-mods>".to_owned())?;
+            let resolved_game_dir = game_dir.or_else(|| out_dir.parent().map(Path::to_path_buf));
+            let resolved_mods_txt = mods_txt.or_else(|| {
+                resolved_game_dir
+                    .as_ref()
+                    .map(|g| g.join("horizon-mods.txt"))
+            });
+
+            let mut archives = Vec::new();
+            let mut seen = BTreeSet::new();
+            let mut collect_from = |dir: &Path, allow_zip: bool| -> Result<(), String> {
+                if !dir.is_dir() {
+                    return Ok(());
+                }
+                let entries =
+                    fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                let mut found = Vec::new();
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_file()
-                        && path
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .is_some_and(|e| e.eq_ignore_ascii_case("jar"))
-                    {
-                        jars.push(path);
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let ok = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| {
+                            e.eq_ignore_ascii_case("jar")
+                                || (allow_zip && e.eq_ignore_ascii_case("zip"))
+                        });
+                    if ok && seen.insert(path.clone()) {
+                        found.push(path);
                     }
                 }
-                jars.sort();
+                found.sort();
+                archives.extend(found);
+                Ok(())
+            };
+
+            collect_from(&mods_dir, true)?;
+            if let Some(gdir) = &resolved_game_dir {
+                collect_from(&gdir.join("datapacks"), true)?;
             }
+
             run_batch_convert(
                 "scan-dir",
-                &jars,
+                &archives,
                 &out_dir,
-                mods_txt.as_deref(),
+                resolved_game_dir.as_deref(),
+                resolved_mods_txt.as_deref(),
                 resources.as_deref(),
                 enable,
                 json_mode,
             )
         }
+        "port-pack" => {
+            let pack = pack_path
+                .or_else(|| args.get(1).map(PathBuf::from))
+                .ok_or_else(|| "missing --pack <dir_or_mrpack_or_zip>".to_owned())?;
+            let target_game_dir =
+                game_dir.ok_or_else(|| "missing --game-dir <target-game-dir>".to_owned())?;
+            let report = port_modpack(&pack, &target_game_dir, resources.as_deref(), enable)?;
+            if json_mode {
+                let payload = PortPackOutput {
+                    ok: true,
+                    engine: "blockway-rust",
+                    mode: "port-pack",
+                    report,
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string(&payload).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!(
+                    "Ported modpack '{}' ({}) -> {}: {} hmods, {} datapacks, {} resourcepacks, {} native Rust mods, {} built-in engine mods.",
+                    report.pack_name,
+                    report.pack_format,
+                    report.game_dir,
+                    report.hmods_created,
+                    report.datapacks_created,
+                    report.resourcepacks_created,
+                    report.native_rust_enabled,
+                    report.builtin_engine_matched
+                );
+            }
+            Ok(())
+        }
         "list" => {
-            let out_dir = out_dir.ok_or_else(|| "missing --out-dir <horizon-mods>".to_owned())?;
-            let mods = list_installed_hmods(&out_dir, mods_txt.as_deref())?;
+            let out_dir = out_dir
+                .or_else(|| game_dir.as_ref().map(|g| g.join("horizon-mods")))
+                .ok_or_else(|| "missing --out-dir <horizon-mods>".to_owned())?;
+            let resolved_game_dir = game_dir.or_else(|| out_dir.parent().map(Path::to_path_buf));
+            let resolved_mods_txt = mods_txt.or_else(|| {
+                resolved_game_dir
+                    .as_ref()
+                    .map(|g| g.join("horizon-mods.txt"))
+            });
+            let mods = list_installed_hmods(&out_dir, resolved_mods_txt.as_deref())?;
+            let native_mods = list_native_mods(resolved_mods_txt.as_deref());
+            let (datapacks, resourcepacks) = match resolved_game_dir.as_deref() {
+                Some(gdir) => (
+                    list_installed_datapacks(gdir),
+                    list_ported_resourcepacks(gdir),
+                ),
+                None => (Vec::new(), Vec::new()),
+            };
             if json_mode {
                 let payload = ListOutput {
                     ok: true,
                     engine: "blockway-rust",
                     mode: "list",
                     mods,
+                    native_mods,
+                    datapacks,
+                    resourcepacks,
                 };
                 println!(
                     "{}",
                     serde_json::to_string(&payload).map_err(|e| e.to_string())?
                 );
-            } else if mods.is_empty() {
-                println!("No .hmod packages installed in {}", out_dir.display());
             } else {
+                println!("Built-in Native Rust Mods:");
+                for nm in &native_mods {
+                    println!(
+                        "  [{}] {} — {}",
+                        if nm.enabled { "ON " } else { "OFF" },
+                        nm.id,
+                        nm.name
+                    );
+                }
+                println!("Installed .hmod Content Packages ({}):", mods.len());
                 for m in &mods {
                     let state = if m.enabled { "ON " } else { "OFF" };
                     println!(
-                        "[{state}] {} ({} {}) — {} blocks, {} items, {} files",
+                        "  [{state}] {} ({} {}) — {} blocks, {} items, {} files",
                         m.id, m.name, m.version, m.blocks, m.items, m.files
                     );
+                }
+                if !datapacks.is_empty() {
+                    println!("Installed Rust 26.3 Datapacks ({}):", datapacks.len());
+                    for dp in &datapacks {
+                        println!("  [ON ] {} — {} files", dp.id, dp.files);
+                    }
                 }
             }
             Ok(())
@@ -216,10 +346,12 @@ fn run(mut args: Vec<String>, json_mode: bool) -> Result<(), String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_batch_convert(
     mode: &'static str,
     jars: &[PathBuf],
     out_dir: &Path,
+    game_dir: Option<&Path>,
     mods_txt: Option<&Path>,
     resources: Option<&Path>,
     auto_enable: bool,
@@ -230,28 +362,49 @@ fn run_batch_convert(
     let mut works = 0usize;
     let mut partly = 0usize;
     let mut skipped_code_only = 0usize;
+    let mut hmods_created = 0usize;
+    let mut datapacks_created = 0usize;
+    let mut resourcepacks_created = 0usize;
+    let mut native_rust_enabled = 0usize;
+    let mut builtin_engine_matched = 0usize;
 
     for jar_path in jars {
-        let mut item = port_jar_to_hmod(jar_path, out_dir, resources);
+        let mut item = port_jar_with_game_dir(jar_path, out_dir, game_dir, resources);
         match item.verdict {
             Verdict::Works => works += 1,
             Verdict::Partly => partly += 1,
             Verdict::No => skipped_code_only += 1,
         }
-        if item.hmod_path.is_some()
-            && auto_enable
-            && let Some(txt) = mods_txt
-        {
-            match set_mod_enabled(txt, Some(out_dir), &item.mod_id, true) {
-                Ok(None) => item.enabled = true,
-                Ok(Some(clash)) => {
-                    item.enabled = false;
-                    item.clash_warning = Some(clash);
-                }
-                Err(e) => {
-                    item.clash_warning = Some(e);
+        match item.kind.as_str() {
+            "hmod" => {
+                hmods_created += 1;
+                if auto_enable && let Some(txt) = mods_txt {
+                    match set_mod_enabled(txt, Some(out_dir), &item.mod_id, true) {
+                        Ok(None) => item.enabled = true,
+                        Ok(Some(clash)) => {
+                            item.enabled = false;
+                            item.clash_warning = Some(clash);
+                        }
+                        Err(e) => {
+                            item.clash_warning = Some(e);
+                        }
+                    }
                 }
             }
+            "native_rust" => {
+                native_rust_enabled += 1;
+                if auto_enable
+                    && let Some(txt) = mods_txt
+                    && let Some(nid) = item.native_mod_id.clone()
+                    && set_mod_enabled(txt, Some(out_dir), &nid, true).is_ok()
+                {
+                    item.enabled = true;
+                }
+            }
+            "datapack" => datapacks_created += 1,
+            "resourcepack" => resourcepacks_created += 1,
+            "builtin_engine" => builtin_engine_matched += 1,
+            _ => {}
         }
         results.push(item);
     }
@@ -267,6 +420,11 @@ fn run_batch_convert(
             works,
             partly,
             skipped_code_only,
+            hmods_created,
+            datapacks_created,
+            resourcepacks_created,
+            native_rust_enabled,
+            builtin_engine_matched,
             results,
         };
         println!(
@@ -275,18 +433,21 @@ fn run_batch_convert(
         );
     } else {
         println!(
-            "Processed {} jar(s): {} ported to .hmod ({} full, {} partial), {} code-only skipped.",
+            "Processed {} file(s): {} ready on Rust ({} hmod, {} datapack, {} resourcepack, {} native Rust, {} built-in engine), {} deep Java code skipped.",
             results.len(),
             ported,
-            works,
-            partly,
+            hmods_created,
+            datapacks_created,
+            resourcepacks_created,
+            native_rust_enabled,
+            builtin_engine_matched,
             skipped_code_only
         );
         for r in &results {
-            println!("  [{}] {} -> {}", r.verdict_label, r.file_name, r.summary);
-            if let Some(p) = &r.hmod_path {
-                println!("    .hmod: {p} (enabled={})", r.enabled);
-            }
+            println!(
+                "  [{} | {}] {} -> {}",
+                r.verdict_label, r.kind, r.file_name, r.summary
+            );
         }
     }
     Ok(())

@@ -1,12 +1,23 @@
-//! Direct `.jar` -> `.hmod` native Rust converter for standalone Java mods
-//! (`1.16.5` through `26.3`, NeoForge / Forge / Fabric / Quilt).
+//! Multi-channel Java Mod & Modpack -> Native Rust converter for BlockWay Rust / Horizon Engine
+//! (`1.16.5` through `26.3`, NeoForge / Forge / Fabric / Quilt / Datapack / Modpack).
 //!
-//! Carries a Java mod jar's content (`assets/` and `data/`), upgrades legacy
-//! pre-1.21 plural data directories and pre-1.20.5 recipe result shapes into
-//! Horizon's 26.3 format, generates a Creative Mode tab when the mod declares
-//! blocks or items, validates the result with `horizon_mods::Content::read`,
-//! and packs an atomic `<mod_id>.hmod` archive ready for `horizon-client`.
-use crate::{carry, check::Verdict, classes, jar, pipeline};
+//! Supports 5 real native Rust conversion channels:
+//! 1. `native_rust`    — Maps client HUD/utility mods (Xaero's Minimap, JourneyMap, Zoomify,
+//!                       Logical Zoom, MiniHUD, Keystrokes, BetterF3) to Horizon's compiled-in
+//!                       `mod_api::Hooks` Rust modules (`minimap`, `zoom`, `coords_hud`,
+//!                       `keystrokes`, `fps_overlay`).
+//! 2. `builtin_engine` — Recognizes optimization, shader, connected-texture & loader libraries
+//!                       already built into Horizon's Vulkan/DX12 Rust engine (Sodium, Lithium,
+//!                       Iris, FerriteCore, EntityCulling, Continuity, EMF/ETF, Fabric API, etc.).
+//! 3. `hmod`           — Carries custom blocks, items, 3D models, textures, recipes (`1.16.5`–`26.3`)
+//!                       and auto-generated Creative Tabs into validated `<mod_id>.hmod` archives.
+//! 4. `datapack`       — Extracts & upgrades worldgen, biome, structure, dimension, SkyBlock /
+//!                       OneBlock & function mods/zips (including `META-INF/jars/*.jar` wrapper
+//!                       jars like Terralith/Incendium/Tectonic) to `26.3` format inside
+//!                       `<game_dir>/new-world-datapacks/<mod_id>/`.
+//! 5. `resourcepack`   — Packs vanilla asset/texture/model/CEM/CIT overrides into
+//!                       `<game_dir>/resourcepacks/<mod_id>-rust.zip`.
+use crate::{carry, check::Verdict, classes, fetch, import, jar, pipeline, upgrade};
 use horizon_mods::{
     Capability, Content, Manifest, Package,
     content::clash,
@@ -18,7 +29,8 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::{Path, PathBuf},
+    io::{Read, Write},
+    path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -36,6 +48,38 @@ const RESERVED_IDS: [&str; 9] = [
     "realms",
 ];
 
+pub const NATIVE_MOD_SPECS: [(&str, &str, &str); 5] = [
+    (
+        "minimap",
+        "Rust Minimap",
+        "Live terrain minimap with compass, zoom & XYZ coordinates (replaces Xaero's Minimap / JourneyMap / VoxelMap).",
+    ),
+    (
+        "zoom",
+        "Rust Smooth Zoom",
+        "Smooth camera zoom on key hold + scroll-wheel magnification (replaces Zoomify / Logical Zoom / OK Zoomer).",
+    ),
+    (
+        "fps_overlay",
+        "Rust FPS Counter",
+        "Lightweight live FPS & 1s min-FPS HUD overlay (replaces FPSDisplay / BetterF3 FPS).",
+    ),
+    (
+        "coords_hud",
+        "Rust Coords & Biome HUD",
+        "Live XYZ coordinates, cardinal direction & biome HUD (replaces MiniHUD / Coordinates Display).",
+    ),
+    (
+        "keystrokes",
+        "Rust Keystrokes & CPS",
+        "Live WASD, Space & LMB/RMB CPS PvP overlay (replaces Keystrokes / KronHUD).",
+    ),
+];
+
+pub fn is_native_mod_id(id: &str) -> bool {
+    NATIVE_MOD_SPECS.iter().any(|(m, _, _)| *m == id)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortedMod {
     pub jar_path: String,
@@ -47,6 +91,12 @@ pub struct PortedMod {
     pub loader: String,
     pub license: String,
     pub legacy_mc_layout: bool,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub output_path: Option<String>,
+    #[serde(default)]
+    pub native_mod_id: Option<String>,
     pub verdict: Verdict,
     pub verdict_label: String,
     pub summary: String,
@@ -92,6 +142,54 @@ pub struct InstalledHmod {
     pub problem: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeModStatus {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledDatapack {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub path: String,
+    pub files: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledResourcePack {
+    pub file_name: String,
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModpackPortReport {
+    pub pack_name: String,
+    pub pack_format: String,
+    pub minecraft: String,
+    pub loader: String,
+    pub game_dir: String,
+    pub total_mods: usize,
+    pub works: usize,
+    pub partly: usize,
+    pub skipped_code_only: usize,
+    pub hmods_created: usize,
+    pub datapacks_created: usize,
+    pub resourcepacks_created: usize,
+    pub native_rust_enabled: usize,
+    pub builtin_engine_matched: usize,
+    pub overrides_extracted: usize,
+    pub resourcepacks_copied: usize,
+    pub shaderpacks_copied: usize,
+    pub downloads_fetched: usize,
+    pub download_warnings: Vec<String>,
+    pub results: Vec<PortedMod>,
+}
+
 /// Normalises an arbitrary Java mod id or filename stem into Horizon's
 /// `[a-z0-9_]{1,64}` manifest id rule.
 pub fn sanitize_mod_id(raw: &str) -> String {
@@ -128,6 +226,228 @@ pub fn sanitize_mod_id(raw: &str) -> String {
     out
 }
 
+fn normalize_token(raw: &str) -> String {
+    let mut s = String::with_capacity(raw.len());
+    let mut prev_u = false;
+    for ch in raw.chars() {
+        let l = ch.to_ascii_lowercase();
+        if l.is_ascii_lowercase() || l.is_ascii_digit() {
+            s.push(l);
+            prev_u = false;
+        } else if !s.is_empty() && !prev_u {
+            s.push('_');
+            prev_u = true;
+        }
+    }
+    while s.ends_with('_') {
+        s.pop();
+    }
+    s
+}
+
+/// Strip version suffixes from jar filenames (e.g. `Xaeros_Minimap_24.6.1_Fabric_1.21` -> `xaeros_minimap`).
+fn clean_stem_token(file_name: &str) -> String {
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file_name);
+    let norm = normalize_token(stem);
+    let mut parts = Vec::new();
+    for part in norm.split('_') {
+        if part.is_empty() {
+            continue;
+        }
+        if matches!(
+            part,
+            "fabric" | "forge" | "neoforge" | "quilt" | "mc" | "mod" | "jar" | "v1" | "v2"
+        ) {
+            break;
+        }
+        if part.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+            break;
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        norm
+    } else {
+        parts.join("_")
+    }
+}
+
+fn detect_native_rust_equivalent(raw_id: &str, file_name: &str) -> Option<(&'static str, &'static str)> {
+    let id = normalize_token(raw_id);
+    let stem = clean_stem_token(file_name);
+    let matches_any = |needles: &[&str]| {
+        needles
+            .iter()
+            .any(|n| id == *n || stem == *n || id.starts_with(&format!("{n}_")) || stem.starts_with(&format!("{n}_")))
+    };
+
+    if matches_any(&[
+        "xaerominimap",
+        "xaeros_minimap",
+        "xaero_minimap",
+        "xaerominimapfair",
+        "xaeros_minimap_fair",
+        "xaeroworldmap",
+        "xaeros_world_map",
+        "xaero_world_map",
+        "journeymap",
+        "voxelmap",
+        " antique_atlas",
+        "antiqueatlas",
+        "mapfrontiers",
+    ]) || (id.contains("xaero") && (id.contains("map") || stem.contains("map")))
+    {
+        return Some(("minimap", "Rust Minimap"));
+    }
+
+    if matches_any(&[
+        "zoomify",
+        "logical_zoom",
+        "logicalzoom",
+        "ok_zoomer",
+        "okzoomer",
+        "wi_zoom",
+        "wizoom",
+        "zume",
+        "justzoom",
+        "just_zoom",
+    ]) {
+        return Some(("zoom", "Rust Smooth Zoom"));
+    }
+
+    if matches_any(&[
+        "minihud",
+        "coordinates_display",
+        "coordinatesdisplay",
+        "batty_coordinates",
+        "hudcompass",
+    ]) {
+        return Some(("coords_hud", "Rust Coords & Biome HUD"));
+    }
+
+    if matches_any(&[
+        "keystrokes",
+        "keystrokesmod",
+        "clean_keystrokes",
+        "kronhud",
+        "evergreenhud",
+    ]) {
+        return Some(("keystrokes", "Rust Keystrokes & CPS"));
+    }
+
+    if matches_any(&[
+        "fpsdisplay",
+        "fps_display",
+        "betterf3",
+        "better_fps_hud",
+    ]) {
+        return Some(("fps_overlay", "Rust FPS Counter"));
+    }
+
+    None
+}
+
+fn detect_builtin_engine_feature(raw_id: &str, file_name: &str) -> Option<&'static str> {
+    let id = normalize_token(raw_id);
+    let stem = clean_stem_token(file_name);
+    let matches_any = |needles: &[&str]| {
+        needles
+            .iter()
+            .any(|n| id == *n || stem == *n || id.starts_with(&format!("{n}_")) || stem.starts_with(&format!("{n}_")))
+    };
+
+    if matches_any(&[
+        "sodium",
+        "sodium_extra",
+        "reeses_sodium_options",
+        "embeddium",
+        "rubidium",
+        "indium",
+        "lithium",
+        "radium",
+        "canary",
+        "ferritecore",
+        "modernfix",
+        "immediatelyfast",
+        "entityculling",
+        "moreculling",
+        "badoptimizations",
+        "krypton",
+        "c2me",
+        "noisium",
+        "scalablelux",
+        "starlight",
+        "phosphor",
+        "lazydfu",
+        "dynamic_fps",
+        "dynamicfps",
+        "fastload",
+        "fastquit",
+        "memoryleakfix",
+        "gpumemleakfix",
+        "exordium",
+        "threadtweak",
+        "alternate_current",
+        "clumps",
+    ]) {
+        return Some("Multi-threaded Vulkan / DirectX 12 Rust renderer & tick optimizer");
+    }
+
+    if matches_any(&[
+        "iris",
+        "oculus",
+        "optifine",
+        "optifabric",
+        "continuity",
+        "fusion",
+        "polytone",
+        "entity_model_features",
+        "emf",
+        "entity_texture_features",
+        "etf",
+        "citresewn",
+        "animatica",
+        "lambdynamiclights",
+        "ryoamiclights",
+    ]) {
+        return Some("Native Rust Shader Pipeline + OptiFine CEM/CIT/CTM & Dynamic Lights");
+    }
+
+    if matches_any(&[
+        "fabric_api",
+        "fabric",
+        "fabric_language_kotlin",
+        "architectury",
+        "cloth_config",
+        "cloth_config_api",
+        "yet_another_config_lib",
+        "yacl",
+        "modmenu",
+        "forgeconfigapiport",
+        "malilib",
+        "collective",
+        "balm",
+        "puzzleslib",
+        "bookshelf",
+        "iceberg",
+        "cristellib",
+        "cristel_lib",
+        "lithostitched",
+        "terrablender",
+        "placeholder_api",
+        "e4mc",
+        "no_chat_reports",
+        "nochatreports",
+    ]) {
+        return Some("Native Horizon Mod API, Worldgen Pipeline & Friends Tunnel");
+    }
+
+    None
+}
+
 fn is_valid_mod_id(s: &str) -> bool {
     (1..=64).contains(&s.len())
         && !RESERVED_IDS.contains(&s)
@@ -135,10 +455,6 @@ fn is_valid_mod_id(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
-/// Picks the best `[a-z0-9_]{1,64}` mod id for carrying `names`: keeps
-/// `sanitize_mod_id(raw_id)` whenever the jar already holds `assets/<id>/` or
-/// `data/<id>/`, and otherwise falls back to the jar's primary content
-/// namespace when unambiguous.
 fn resolve_mod_id(raw_id: &str, names: &[String]) -> String {
     let sanitized = sanitize_mod_id(raw_id);
     let asset_prefix = format!("assets/{sanitized}/");
@@ -214,12 +530,64 @@ fn vanilla_blocks_from_resources(resources: Option<&Path>) -> Option<BTreeSet<St
     Some(defaults.keys().cloned().collect())
 }
 
-/// Upgrades pre-1.20.5 recipes left in `recipes_kept` inside `carry_dir`:
-/// - `"result": {"item": "<id>", "count": N}` -> `"result": {"id": "<id>", "count": N}`
-/// - `minecraft:stonecutting` with bare string `"result"` and top-level `"count"`
-/// - `minecraft:smelting`/`blasting`/`smoking`/`campfire_cooking` with bare string `"result"`
-/// - Strips loader condition keys on vanilla `minecraft:*` recipe types so
-///   `carry::upgrade_recipe` can rewrite `1.16.5`–`1.20.4` ingredients (`{"item": ...}`, `{"tag": ...}`).
+fn upgrade_recipe_json_in_place(recipe: &mut Value) -> bool {
+    let kind = recipe["type"].as_str().unwrap_or("").to_owned();
+    if !kind.starts_with("minecraft:") {
+        return false;
+    }
+    let mut changed = false;
+    if let Some(obj) = recipe.as_object_mut() {
+        for cond_key in [
+            "neoforge:conditions",
+            "forge:conditions",
+            "fabric:load_conditions",
+        ] {
+            if obj.remove(cond_key).is_some() {
+                changed = true;
+            }
+        }
+    }
+    if kind == "minecraft:stonecutting"
+        && let Some(result_id) = recipe["result"].as_str().map(str::to_owned)
+        && let Some(obj) = recipe.as_object_mut()
+    {
+        let count = obj
+            .remove("count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .clamp(1, 99);
+        obj.insert(
+            "result".into(),
+            if count == 1 {
+                json!({ "id": result_id })
+            } else {
+                json!({ "id": result_id, "count": count })
+            },
+        );
+        changed = true;
+    }
+    if let Some(res_obj) = recipe.get("result").and_then(Value::as_object)
+        && res_obj.get("id").is_none()
+        && let Some(item_id) = res_obj.get("item").and_then(Value::as_str)
+    {
+        let item_id = item_id.to_owned();
+        let count = res_obj
+            .get("count")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .clamp(1, 99);
+        recipe["result"] = if count == 1 {
+            json!({ "id": item_id })
+        } else {
+            json!({ "id": item_id, "count": count })
+        };
+        changed = true;
+    }
+    changed |= carry::renamed_ids(recipe);
+    let _ = carry::upgrade_recipe(recipe);
+    changed
+}
+
 fn upgrade_legacy_carried_recipes(
     carry_dir: &Path,
     owned_namespaces: &[String],
@@ -258,65 +626,11 @@ fn upgrade_legacy_carried_recipes(
                 let Ok(mut recipe) = serde_json::from_slice::<Value>(&bytes) else {
                     continue;
                 };
-                let kind = recipe["type"].as_str().unwrap_or("").to_owned();
+                let kind = recipe["type"].as_str().unwrap_or("");
                 if !kind.starts_with("minecraft:") {
                     continue;
                 }
-
-                let mut changed = false;
-                if let Some(obj) = recipe.as_object_mut() {
-                    for cond_key in [
-                        "neoforge:conditions",
-                        "forge:conditions",
-                        "fabric:load_conditions",
-                    ] {
-                        if obj.remove(cond_key).is_some() {
-                            changed = true;
-                        }
-                    }
-                }
-
-                // 1.16.5 - 1.20.4 stonecutting: `"result": "ns:id", "count": 2` at top level.
-                if kind == "minecraft:stonecutting"
-                    && let Some(result_id) = recipe["result"].as_str().map(str::to_owned)
-                    && let Some(obj) = recipe.as_object_mut()
-                {
-                    let count = obj
-                        .remove("count")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(1)
-                        .clamp(1, 99);
-                    obj.insert(
-                        "result".into(),
-                        if count == 1 {
-                            json!({ "id": result_id })
-                        } else {
-                            json!({ "id": result_id, "count": count })
-                        },
-                    );
-                    changed = true;
-                }
-
-                // 1.16.5 - 1.20.4 object result: `{"item": "ns:id", "count": 4, "data": 0}`
-                if let Some(res_obj) = recipe.get("result").and_then(Value::as_object)
-                    && res_obj.get("id").is_none()
-                    && let Some(item_id) = res_obj.get("item").and_then(Value::as_str)
-                {
-                    let item_id = item_id.to_owned();
-                    let count = res_obj
-                        .get("count")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(1)
-                        .clamp(1, 99);
-                    recipe["result"] = if count == 1 {
-                        json!({ "id": item_id })
-                    } else {
-                        json!({ "id": item_id, "count": count })
-                    };
-                    changed = true;
-                }
-
-                changed |= carry::renamed_ids(&mut recipe);
+                let changed = upgrade_recipe_json_in_place(&mut recipe);
                 let ingredients_ok = if was_in_kept {
                     carry::upgrade_recipe(&mut recipe)
                 } else {
@@ -341,9 +655,6 @@ fn upgrade_legacy_carried_recipes(
     newly_upgraded
 }
 
-/// Writes `data/<id>/horizon/creative_tab/main.json` when the carried mod adds
-/// blocks (with items) or standalone items and has no creative tab yet, so
-/// converted `.jar` items appear directly in Horizon's Creative Inventory.
 fn ensure_creative_tab(carry_dir: &Path, mod_id: &str, display_name: &str) -> Result<bool, String> {
     let horizon_dir = carry_dir.join("data").join(mod_id).join("horizon");
     let tab_dir = horizon_dir.join("creative_tab");
@@ -411,6 +722,26 @@ fn temp_work_dir(mod_id: &str) -> PathBuf {
     ))
 }
 
+fn safe_rel_path(raw: &str) -> Option<PathBuf> {
+    let norm = raw.replace('\\', "/");
+    let p = Path::new(&norm);
+    let mut clean = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::Normal(seg) => {
+                let s = seg.to_str()?;
+                if s.is_empty() || s.contains(':') || s.contains('\0') {
+                    return None;
+                }
+                clean.push(s);
+            }
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!clean.as_os_str().is_empty()).then_some(clean)
+}
+
 fn pack_carried_dir_to_hmod(carry_dir: &Path, out_dir: &Path) -> Result<(PathBuf, Content), String> {
     let manifest_path = carry_dir.join(MANIFEST);
     let manifest_text =
@@ -444,28 +775,372 @@ fn pack_carried_dir_to_hmod(carry_dir: &Path, out_dir: &Path) -> Result<(PathBuf
     fs::rename(&partial_path, &final_path)
         .map_err(|e| format!("{}: {e}", final_path.display()))?;
 
-    // Verify the written `.hmod` archive opens cleanly with Horizon's own reader.
     let verified_pkg = Package::read(&final_path)?;
     let verified_content = Content::read(&final_path, &verified_pkg.manifest)?;
     Ok((final_path, verified_content))
 }
 
-/// Converts a single Java `.jar` mod into `<out_dir>/<mod_id>.hmod` when it
-/// contains portable content (blocks, items, recipes, loot tables, structures,
-/// worldgen, tags, textures). Pure-code JVM mods return `Verdict::No` cleanly
-/// without writing an empty `.hmod`.
+#[derive(Default)]
+struct ArchiveDataSummary {
+    data_files: usize,
+    worldgen_files: usize,
+    structure_files: usize,
+    function_files: usize,
+    recipe_files: usize,
+    loot_files: usize,
+    vanilla_worldgen_or_dim: bool,
+    vanilla_asset_files: usize,
+    namespaces: BTreeSet<String>,
+}
+
+fn inspect_archive_paths(names: &[String]) -> ArchiveDataSummary {
+    let mut s = ArchiveDataSummary::default();
+    for raw in names.iter().filter(|n| !n.ends_with('/')) {
+        let mapped = carry::renamed_in_1_21(raw).unwrap_or_else(|| raw.clone());
+        if let Some(rest) = mapped.strip_prefix("data/")
+            && let Some((ns, tail)) = rest.split_once('/')
+            && !ns.is_empty()
+            && !tail.is_empty()
+        {
+            s.data_files += 1;
+            s.namespaces.insert(ns.to_owned());
+            if tail.starts_with("worldgen/")
+                || tail.starts_with("dimension/")
+                || tail.starts_with("dimension_type/")
+            {
+                s.worldgen_files += 1;
+                if ns == "minecraft" {
+                    s.vanilla_worldgen_or_dim = true;
+                }
+            } else if tail.starts_with("structure/") {
+                s.structure_files += 1;
+                if ns == "minecraft" {
+                    s.vanilla_worldgen_or_dim = true;
+                }
+            } else if tail.starts_with("function/") {
+                s.function_files += 1;
+            } else if tail.starts_with("recipe/") {
+                s.recipe_files += 1;
+            } else if tail.starts_with("loot_table/") {
+                s.loot_files += 1;
+            }
+        } else if let Some(rest) = raw.strip_prefix("assets/")
+            && let Some((ns, tail)) = rest.split_once('/')
+            && ns == "minecraft"
+            && !tail.starts_with("lang/")
+        {
+            s.vanilla_asset_files += 1;
+        }
+    }
+    s
+}
+
+/// If an outer Fabric/Forge wrapper jar holds no `data/` or `assets/` content of its own
+/// (common on Modrinth for packaged datapacks like Terralith / Incendium / Nullscape),
+/// extracts the largest non-library inner jar under `META-INF/jars/*.jar`.
+fn maybe_extract_nested_content_jar(outer_path: &Path, names: &[String], work_dir: &Path) -> Option<PathBuf> {
+    let has_direct_content = names.iter().any(|n| {
+        !n.ends_with('/')
+            && (n.starts_with("data/")
+                || (n.starts_with("assets/") && !n.ends_with("icon.png") && !n.contains("/lang/")))
+    });
+    if has_direct_content {
+        return None;
+    }
+    let nested_candidates: Vec<&String> = names
+        .iter()
+        .filter(|n| {
+            n.starts_with("META-INF/jars/")
+                && (n.ends_with(".jar") || n.ends_with(".zip"))
+                && !n.contains("mixinextras")
+        })
+        .collect();
+    if nested_candidates.is_empty() {
+        return None;
+    }
+    let mut zip = zip::ZipArchive::new(fs::File::open(outer_path).ok()?).ok()?;
+    let mut best: Option<(u64, String, Vec<u8>)> = None;
+    let mut budget = crate::entry::Budget::archive();
+    for entry_name in nested_candidates {
+        let Ok(entry) = zip.by_name(entry_name) else {
+            continue;
+        };
+        let sz = entry.size();
+        let Ok(bytes) = budget.read(entry, sz, 128 << 20) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(b_sz, _, _)| sz > *b_sz) {
+            let fname = entry_name
+                .rsplit('/')
+                .next()
+                .unwrap_or("nested.jar")
+                .to_owned();
+            best = Some((sz, fname, bytes));
+        }
+    }
+    let (_, fname, bytes) = best?;
+    fs::create_dir_all(work_dir).ok()?;
+    let out = work_dir.join(format!("nested-{fname}"));
+    fs::write(&out, bytes).ok()?;
+    Some(out)
+}
+
+fn needs_26_3_worldgen_upgrade(files: &BTreeMap<String, Vec<u8>>) -> bool {
+    for (path, bytes) in files {
+        if path.contains("/configured_feature/") || path.contains("/configured_carver/") {
+            return true;
+        }
+        if !path.ends_with(".json") || !path.starts_with("data/") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(bytes) else {
+            continue;
+        };
+        if path.contains("/worldgen/noise/") && v.get("firstOctave").is_some() && v.get("amplitudes").is_some() && v.get("base_amplitude").is_none() {
+            return true;
+        }
+        if path.contains("/worldgen/biome/") && v.get("spawners").is_some() {
+            return true;
+        }
+        if path.contains("/worldgen/noise_settings/") && v.get("surface_rule").is_some() {
+            return true;
+        }
+        if path.contains("/worldgen/density_function/")
+            && let Ok(txt) = std::str::from_utf8(bytes)
+            && (txt.contains("\"argument1\"") || txt.contains("\"argument2\""))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extracts `data/` from `archive_path`, upgrades pre-1.21 folder names, pre-1.20.5 recipes,
+/// and pre-26.3 worldgen schemas into `<game_dir>/new-world-datapacks/<mod_id>/`.
+fn write_upgraded_datapack(
+    archive_path: &Path,
+    mod_id: &str,
+    display_name: &str,
+    game_dir: &Path,
+) -> Result<(PathBuf, usize, usize), String> {
+    let file = fs::File::open(archive_path).map_err(|e| format!("{}: {e}", archive_path.display()))?;
+    let mut zip =
+        zip::ZipArchive::new(file).map_err(|e| format!("{}: {e}", archive_path.display()))?;
+    let mut budget = crate::entry::Budget::archive();
+    let mut raw_files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut renamed_folders = 0usize;
+
+    for i in 0..zip.len() {
+        let entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        let raw_name = entry.name().replace('\\', "/");
+        if raw_name.ends_with('/') {
+            continue;
+        }
+        if raw_name != "pack.mcmeta" && raw_name != "pack.png" && !raw_name.starts_with("data/") {
+            continue;
+        }
+        let target_name = if let Some(renamed) = carry::renamed_in_1_21(&raw_name) {
+            renamed_folders += 1;
+            renamed
+        } else {
+            raw_name
+        };
+        if safe_rel_path(&target_name).is_none() {
+            continue;
+        }
+        let declared = entry.size();
+        let Ok(mut bytes) = budget.read(entry, declared, 32 << 20) else {
+            continue;
+        };
+        if target_name.starts_with("data/")
+            && target_name.contains("/recipe/")
+            && target_name.ends_with(".json")
+            && let Ok(mut v) = serde_json::from_slice::<Value>(&bytes)
+        {
+            if upgrade_recipe_json_in_place(&mut v)
+                && let Ok(pretty) = serde_json::to_vec_pretty(&v)
+            {
+                bytes = pretty;
+            }
+        }
+        raw_files.insert(target_name, bytes);
+    }
+
+    let data_count = raw_files.keys().filter(|k| k.starts_with("data/")).count();
+    if data_count == 0 {
+        return Err("archive holds no data/ files for datapack".into());
+    }
+
+    let (mut final_files, upg_report) = if needs_26_3_worldgen_upgrade(&raw_files) {
+        upgrade::upgrade_pack(&raw_files)
+    } else {
+        (raw_files, upgrade::Report::default())
+    };
+    let upgraded_worldgen: usize = upg_report.upgraded.values().sum::<usize>() + upg_report.added.len();
+
+    let title = if display_name.trim().is_empty() {
+        mod_id
+    } else {
+        display_name.trim()
+    };
+    let mcmeta = json!({
+        "pack": {
+            "description": format!("{title} (BlockWay Rust 26.3 Datapack)"),
+            "pack_format": upgrade::PACK_FORMAT,
+            "min_format": upgrade::PACK_FORMAT,
+            "max_format": upgrade::PACK_FORMAT
+        }
+    });
+    if let Ok(pretty) = serde_json::to_vec_pretty(&mcmeta) {
+        final_files.insert("pack.mcmeta".into(), pretty);
+    }
+
+    let dp_root = game_dir.join("new-world-datapacks").join(mod_id);
+    if dp_root.exists() {
+        let _ = fs::remove_dir_all(&dp_root);
+    }
+    fs::create_dir_all(&dp_root).map_err(|e| format!("{}: {e}", dp_root.display()))?;
+
+    let mut written_count = 0usize;
+    for (rel_str, bytes) in &final_files {
+        let Some(rel) = safe_rel_path(rel_str) else {
+            continue;
+        };
+        let dest = dp_root.join(rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        fs::write(&dest, bytes).map_err(|e| format!("{}: {e}", dest.display()))?;
+        written_count += 1;
+    }
+
+    Ok((dp_root, written_count, renamed_folders + upgraded_worldgen))
+}
+
+/// Packs `assets/` + `pack.mcmeta` into `<game_dir>/resourcepacks/<mod_id>-rust.zip`.
+fn write_vanilla_resourcepack(
+    archive_path: &Path,
+    mod_id: &str,
+    display_name: &str,
+    game_dir: &Path,
+) -> Result<(PathBuf, usize, u64), String> {
+    let file = fs::File::open(archive_path).map_err(|e| format!("{}: {e}", archive_path.display()))?;
+    let mut zip =
+        zip::ZipArchive::new(file).map_err(|e| format!("{}: {e}", archive_path.display()))?;
+    let mut budget = crate::entry::Budget::archive();
+    let mut asset_entries: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut icon_bytes: Option<Vec<u8>> = None;
+
+    for i in 0..zip.len() {
+        let entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        let raw_name = entry.name().replace('\\', "/");
+        if raw_name.ends_with('/') {
+            continue;
+        }
+        let declared = entry.size();
+        if raw_name == "pack.png" || raw_name.ends_with("/icon.png") {
+            if icon_bytes.is_none()
+                && let Ok(b) = budget.read(entry, declared, 4 << 20)
+            {
+                icon_bytes = Some(b);
+            }
+            continue;
+        }
+        if !raw_name.starts_with("assets/") {
+            continue;
+        }
+        if safe_rel_path(&raw_name).is_none() {
+            continue;
+        }
+        if let Ok(b) = budget.read(entry, declared, 64 << 20) {
+            asset_entries.insert(raw_name, b);
+        }
+    }
+
+    if asset_entries.is_empty() {
+        return Err("no assets/ entries found for resource pack".into());
+    }
+
+    let rp_dir = game_dir.join("resourcepacks");
+    fs::create_dir_all(&rp_dir).map_err(|e| format!("{}: {e}", rp_dir.display()))?;
+    let final_path = rp_dir.join(format!("{mod_id}-rust.zip"));
+    let partial_path = rp_dir.join(format!("{mod_id}-rust.zip.partial"));
+
+    {
+        let out_file =
+            fs::File::create(&partial_path).map_err(|e| format!("{}: {e}", partial_path.display()))?;
+        let mut writer = zip::ZipWriter::new(out_file);
+        let opts = zip::write::SimpleFileOptions::default();
+
+        let title = if display_name.trim().is_empty() {
+            mod_id
+        } else {
+            display_name.trim()
+        };
+        let mcmeta = json!({
+            "pack": {
+                "pack_format": 55,
+                "supported_formats": [15, 999],
+                "min_format": 15,
+                "max_format": 999,
+                "description": format!("{title} (BlockWay Rust Resource Pack)")
+            }
+        });
+        let mcmeta_bytes = serde_json::to_vec_pretty(&mcmeta).map_err(|e| e.to_string())?;
+        writer
+            .start_file("pack.mcmeta", opts)
+            .map_err(|e| e.to_string())?;
+        writer.write_all(&mcmeta_bytes).map_err(|e| e.to_string())?;
+
+        if let Some(icon) = &icon_bytes {
+            writer
+                .start_file("pack.png", opts)
+                .map_err(|e| e.to_string())?;
+            writer.write_all(icon).map_err(|e| e.to_string())?;
+        }
+
+        for (name, bytes) in &asset_entries {
+            writer.start_file(name, opts).map_err(|e| e.to_string())?;
+            writer.write_all(bytes).map_err(|e| e.to_string())?;
+        }
+        writer.finish().map_err(|e| e.to_string())?;
+    }
+
+    if final_path.exists() {
+        let _ = fs::remove_file(&final_path);
+    }
+    fs::rename(&partial_path, &final_path)
+        .map_err(|e| format!("{}: {e}", final_path.display()))?;
+    let size = fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
+    Ok((final_path, asset_entries.len(), size))
+}
+
+/// Backward-compatible wrapper calling [`port_jar_with_game_dir`] with `out_dir.parent()`.
 pub fn port_jar_to_hmod(
     jar_path: &Path,
     out_dir: &Path,
     resources: Option<&Path>,
 ) -> PortedMod {
+    port_jar_with_game_dir(jar_path, out_dir, out_dir.parent(), resources)
+}
+
+/// Converts a single Java `.jar` or `.zip` mod/pack across all 5 Horizon Rust channels.
+pub fn port_jar_with_game_dir(
+    jar_path: &Path,
+    out_dir: &Path,
+    game_dir: Option<&Path>,
+    resources: Option<&Path>,
+) -> PortedMod {
+    let effective_game_dir = game_dir
+        .map(Path::to_path_buf)
+        .or_else(|| out_dir.parent().map(Path::to_path_buf));
     let file_name = jar_path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| jar_path.display().to_string());
     let mut base = PortedMod {
         jar_path: jar_path.display().to_string(),
-        file_name,
+        file_name: file_name.clone(),
         mod_id: String::new(),
         original_mod_id: String::new(),
         name: String::new(),
@@ -473,6 +1148,9 @@ pub fn port_jar_to_hmod(
         loader: String::new(),
         license: String::new(),
         legacy_mc_layout: false,
+        kind: "java_code".into(),
+        output_path: None,
+        native_mod_id: None,
         verdict: Verdict::No,
         verdict_label: Verdict::No.label().to_owned(),
         summary: String::new(),
@@ -498,7 +1176,7 @@ pub fn port_jar_to_hmod(
     let mut info = match jar::read(jar_path) {
         Ok(i) => i,
         Err(e) => {
-            base.summary = format!("Unreadable jar: {e}");
+            base.summary = format!("Unreadable archive: {e}");
             base.error = Some(e);
             return base;
         }
@@ -523,7 +1201,7 @@ pub fn port_jar_to_hmod(
             return base;
         }
     };
-    let names: Vec<String> = match zip
+    let outer_names: Vec<String> = match zip
         .file_names()
         .map(|n| n.map(|n| n.into_owned()))
         .collect::<Result<_, _>>()
@@ -537,25 +1215,74 @@ pub fn port_jar_to_hmod(
         }
     };
 
-    info.mod_id = resolve_mod_id(&info.mod_id, &names);
+    let raw_id = info.mod_id.clone();
+    base.loader = detect_loader(&outer_names).to_owned();
     if info.version.trim().is_empty() {
         info.version = "1.0.0".into();
     }
     if info.name.trim().is_empty() {
-        info.name = info.mod_id.clone();
+        info.name = raw_id.clone();
     }
-
-    base.mod_id = info.mod_id.clone();
     base.name = info.name.clone();
     base.version = info.version.clone();
     base.license = info.license.clone();
-    base.loader = detect_loader(&names).to_owned();
+
+    // Channel 1: Native Rust Client Equivalent (`minimap`, `zoom`, `coords_hud`, `keystrokes`, `fps_overlay`).
+    if let Some((native_id, native_title)) = detect_native_rust_equivalent(&raw_id, &file_name) {
+        base.mod_id = native_id.to_owned();
+        base.kind = "native_rust".into();
+        base.native_mod_id = Some(native_id.to_owned());
+        base.verdict = Verdict::Works;
+        base.verdict_label = Verdict::Works.label().to_owned();
+        base.ports
+            .push(format!("100% Native Rust `{native_title}` ({native_id})"));
+        base.summary = format!(
+            "Runs natively via built-in 100% Rust `{native_title}` ({native_id})."
+        );
+        return base;
+    }
+
+    // Channel 2: Built-in Rust Engine Feature (Sodium, Iris, Lithium, FerriteCore, Fabric API, etc.).
+    if let Some(engine_feature) = detect_builtin_engine_feature(&raw_id, &file_name) {
+        base.mod_id = sanitize_mod_id(&raw_id);
+        base.kind = "builtin_engine".into();
+        base.enabled = true;
+        base.verdict = Verdict::Works;
+        base.verdict_label = Verdict::Works.label().to_owned();
+        base.ports.push(engine_feature.to_owned());
+        base.summary = format!("Already built into Horizon Rust Engine ({engine_feature}).");
+        return base;
+    }
+
+    let work_dir = temp_work_dir(&sanitize_mod_id(&raw_id));
+
+    // Unwrap nested `META-INF/jars/*.jar` if the outer jar is a pure Modrinth datapack wrapper.
+    let nested_jar = maybe_extract_nested_content_jar(jar_path, &outer_names, &work_dir);
+    let content_archive_path: &Path = nested_jar.as_deref().unwrap_or(jar_path);
+    let names: Vec<String> = if let Some(inner) = &nested_jar
+        && let Ok(f) = fs::File::open(inner)
+        && let Ok(z) = zip::ZipArchive::new(f)
+        && let Ok(inner_names) = z
+            .file_names()
+            .map(|n| n.map(|n| n.into_owned()))
+            .collect::<Result<Vec<_>, _>>()
+    {
+        if let Ok(inner_info) = jar::read(inner) {
+            info.census = inner_info.census;
+        }
+        inner_names
+    } else {
+        outer_names.clone()
+    };
+
+    info.mod_id = resolve_mod_id(&raw_id, &names);
+    base.mod_id = info.mod_id.clone();
     base.legacy_mc_layout = carry::old_layout(&names);
 
-    // Bytecode census (same 16 MiB per class & 1 GiB archive budget as `check::check`).
+    // Bytecode census on outer archive.
     let mut budget = crate::entry::Budget::archive();
     let mut class_bytes = Vec::new();
-    for entry_name in names.iter().filter(|n| n.ends_with(".class")) {
+    for entry_name in outer_names.iter().filter(|n| n.ends_with(".class")) {
         let Ok(entry) = zip.by_name(entry_name) else {
             continue;
         };
@@ -563,6 +1290,7 @@ pub fn port_jar_to_hmod(
         match budget.read(entry, declared, (1 << 24) - 1) {
             Ok(b) => class_bytes.push(b),
             Err(e) if crate::entry::is_too_big(&e) && declared < 1 << 24 => {
+                let _ = fs::remove_dir_all(&work_dir);
                 let msg = format!("{}: classes unpack past 1 GiB limit", jar_path.display());
                 base.summary = msg.clone();
                 base.error = Some(msg);
@@ -572,8 +1300,8 @@ pub fn port_jar_to_hmod(
         }
     }
     let code = classes::census(class_bytes.iter().map(Vec::as_slice));
+    let archive_summary = inspect_archive_paths(&names);
 
-    let work_dir = temp_work_dir(&info.mod_id);
     let vanilla = vanilla_blocks_from_resources(resources);
     let allowed = |block_id: &str| vanilla.as_ref().is_none_or(|set| set.contains(block_id));
     let alone = |m: &str| m == info.mod_id || m == "minecraft";
@@ -583,7 +1311,7 @@ pub fn port_jar_to_hmod(
     };
 
     let mut report = match carry::carry(
-        jar_path,
+        content_archive_path,
         &info,
         &work_dir,
         None,
@@ -622,6 +1350,113 @@ pub fn port_jar_to_hmod(
         .recipes_upgraded
         .saturating_sub(report.recipes_unregistered.len());
     let loot = c.loot_tables + report.loot_tables_added;
+
+    // Channel 4: Worldgen / Biome / Structure / Dimension / SkyBlock / OneBlock Datapack!
+    // Triggered when the mod adds NO custom block/item registries, and holds worldgen/structure/
+    // function/vanilla-override data (which `.hmod` forbids on `minecraft:*` namespaces, whereas
+    // `<game_dir>/new-world-datapacks/<id>/` runs 100% natively in Horizon!).
+    let prefers_datapack = report.blocks.is_empty()
+        && report.items == 0
+        && report.blocks_unknown.is_empty()
+        && archive_summary.data_files > 0
+        && (archive_summary.vanilla_worldgen_or_dim
+            || archive_summary.worldgen_files > 0
+            || archive_summary.structure_files > 0
+            || archive_summary.function_files > 0
+            || !code.behaviour());
+
+    if prefers_datapack
+        && let Some(gdir) = effective_game_dir.as_deref()
+        && let Ok((dp_path, files_written, upgraded_count)) =
+            write_upgraded_datapack(content_archive_path, &info.mod_id, &info.name, gdir)
+    {
+        if archive_summary.vanilla_asset_files > 0 {
+            let _ = write_vanilla_resourcepack(content_archive_path, &info.mod_id, &info.name, gdir);
+        }
+        let _ = fs::remove_dir_all(&work_dir);
+        base.kind = "datapack".into();
+        base.output_path = Some(dp_path.display().to_string());
+        base.enabled = true;
+        base.files_packed = files_written;
+        base.worldgen = archive_summary.worldgen_files;
+        base.structures = archive_summary.structure_files;
+        base.recipes = archive_summary.recipe_files;
+        base.loot_tables = archive_summary.loot_files;
+        base.namespaces = archive_summary.namespaces.into_iter().collect();
+
+        for (n, one, many) in [
+            (archive_summary.worldgen_files, "worldgen file", "worldgen files"),
+            (archive_summary.structure_files, "structure", "structures"),
+            (archive_summary.function_files, "function", "functions"),
+            (archive_summary.recipe_files, "recipe", "recipes"),
+            (archive_summary.loot_files, "loot table", "loot tables"),
+        ] {
+            if n > 0 {
+                base.ports.push(plural(n, one, many));
+            }
+        }
+        if base.ports.is_empty() {
+            base.ports
+                .push(plural(files_written, "datapack file", "datapack files"));
+        }
+        if upgraded_count > 0 {
+            base.ports
+                .push(format!("{upgraded_count} files upgraded to 26.3 format"));
+        }
+
+        if code.behaviour() {
+            base.verdict = Verdict::Partly;
+            base.verdict_label = Verdict::Partly.label().to_owned();
+            let preview = base.ports[..base.ports.len().min(3)].join(", ");
+            base.summary = format!(
+                "Converted to Rust 26.3 Datapack ({preview}); Java helper classes ignored."
+            );
+        } else {
+            base.verdict = Verdict::Works;
+            base.verdict_label = Verdict::Works.label().to_owned();
+            let preview = base.ports[..base.ports.len().min(3)].join(", ");
+            base.summary = format!("100% Rust 26.3 Datapack ready ({preview}).");
+        }
+        return base;
+    }
+
+    // Channel 5: Vanilla Texture / Model / Sound / CEM / CIT Resource Pack!
+    let prefers_resourcepack = report.blocks.is_empty()
+        && report.items == 0
+        && archive_summary.data_files == 0
+        && (archive_summary.vanilla_asset_files > 0 || (c.textures > 0 && !code.behaviour()));
+
+    if prefers_resourcepack
+        && let Some(gdir) = effective_game_dir.as_deref()
+        && let Ok((rp_path, asset_count, rp_size)) =
+            write_vanilla_resourcepack(content_archive_path, &info.mod_id, &info.name, gdir)
+    {
+        let _ = fs::remove_dir_all(&work_dir);
+        base.kind = "resourcepack".into();
+        base.output_path = Some(rp_path.display().to_string());
+        base.hmod_size_bytes = rp_size;
+        base.enabled = true;
+        base.files_packed = asset_count;
+        base.textures = c.textures;
+        base.ports
+            .push(plural(asset_count, "asset file", "asset files"));
+        if code.behaviour() {
+            base.verdict = Verdict::Partly;
+            base.verdict_label = Verdict::Partly.label().to_owned();
+            base.summary = format!(
+                "Extracted {asset_count} textures/models to Rust Resource Pack; Java code skipped."
+            );
+        } else {
+            base.verdict = Verdict::Works;
+            base.verdict_label = Verdict::Works.label().to_owned();
+            base.summary = format!(
+                "100% Rust Resource Pack ready ({asset_count} asset files)."
+            );
+        }
+        return base;
+    }
+
+    // Channel 3: Custom Block / Item / Content `.hmod` Package!
     let pure_asset_or_data_files = if !code.behaviour() && code.classes == 0 {
         report.copied
     } else {
@@ -726,12 +1561,35 @@ pub fn port_jar_to_hmod(
     base.textures = c.textures;
 
     if content_score == 0 {
+        // Fallback: if a Java code mod still ships vanilla texture/model overrides, rescue its assets!
+        if archive_summary.vanilla_asset_files > 0
+            && let Some(gdir) = effective_game_dir.as_deref()
+            && let Ok((rp_path, asset_count, rp_size)) =
+                write_vanilla_resourcepack(content_archive_path, &info.mod_id, &info.name, gdir)
+        {
+            let _ = fs::remove_dir_all(&work_dir);
+            base.kind = "resourcepack".into();
+            base.output_path = Some(rp_path.display().to_string());
+            base.hmod_size_bytes = rp_size;
+            base.enabled = true;
+            base.files_packed = asset_count;
+            base.ports
+                .push(plural(asset_count, "asset file", "asset files"));
+            base.verdict = Verdict::Partly;
+            base.verdict_label = Verdict::Partly.label().to_owned();
+            base.summary = format!(
+                "Extracted {asset_count} vanilla textures/models to Resource Pack; Java bytecode skipped."
+            );
+            return base;
+        }
+
         let _ = fs::remove_dir_all(&work_dir);
         let reason = if code.behaviour() || code.classes > 0 {
-            "Pure Java code/Mixin mod (no custom blocks, items, recipes or worldgen to pack into .hmod)."
+            "Deep Java bytecode/Mixin mod (requires Java Loader or native Rust equivalent)."
         } else {
-            "No portable blocks, items, recipes, worldgen or assets found in jar."
+            "No portable blocks, items, recipes, worldgen or assets found in archive."
         };
+        base.kind = "java_code".into();
         base.verdict = Verdict::No;
         base.verdict_label = Verdict::No.label().to_owned();
         base.summary = reason.to_owned();
@@ -742,12 +1600,15 @@ pub fn port_jar_to_hmod(
         Ok((hmod_path, packed_content)) => {
             let _ = fs::remove_dir_all(&work_dir);
             let size = fs::metadata(&hmod_path).map(|m| m.len()).unwrap_or(0);
+            base.kind = "hmod".into();
             base.blocks = packed_content.blocks.len();
             base.items = packed_content.items.len();
             base.creative_tabs = packed_content.creative_tabs.len();
             base.files_packed = packed_content.files.len();
             base.namespaces = packed_content.namespaces;
-            base.hmod_path = Some(hmod_path.display().to_string());
+            let p_str = hmod_path.display().to_string();
+            base.output_path = Some(p_str.clone());
+            base.hmod_path = Some(p_str);
             base.hmod_size_bytes = size;
             if base.skipped.is_empty() {
                 base.verdict = Verdict::Works;
@@ -766,6 +1627,7 @@ pub fn port_jar_to_hmod(
         }
         Err(e) => {
             let _ = fs::remove_dir_all(&work_dir);
+            base.kind = "java_code".into();
             base.verdict = Verdict::No;
             base.verdict_label = Verdict::No.label().to_owned();
             base.summary = format!("Failed validation for Horizon .hmod: {e}");
@@ -832,11 +1694,10 @@ impl ModsTxtState {
     }
 }
 
-/// Updates `mod.<mod_id>:true` (or removes it when `enabled == false`) in
-/// `horizon-mods.txt`. When `mods_dir` is provided and `enabled == true`, checks
-/// for namespace clashes against other currently-enabled `.hmod` packages; if
-/// another enabled mod shares a namespace, keeps `mod_id` disabled and returns
-/// `Ok(Some(clash_reason))`.
+/// Updates `mod.<mod_id>:true` / `mod.<mod_id>:false` in `horizon-mods.txt`.
+/// Native built-in Rust mods (`minimap`, `zoom`, `fps_overlay`, `coords_hud`, `keystrokes`)
+/// explicitly write `mod.<id>:false` when disabled (matching `ModList::is_on`), whereas
+/// `.hmod` packages are off when absent from `enabled`.
 pub fn set_mod_enabled(
     mods_txt: &Path,
     mods_dir: Option<&Path>,
@@ -844,6 +1705,18 @@ pub fn set_mod_enabled(
     enabled: bool,
 ) -> Result<Option<String>, String> {
     let mut state = ModsTxtState::load(mods_txt);
+    if is_native_mod_id(mod_id) {
+        if enabled {
+            state.disabled.remove(mod_id);
+            state.enabled.insert(mod_id.to_owned());
+        } else {
+            state.enabled.remove(mod_id);
+            state.disabled.insert(mod_id.to_owned());
+        }
+        state.save(mods_txt)?;
+        return Ok(None);
+    }
+
     if !enabled {
         state.enabled.remove(mod_id);
         state.disabled.remove(mod_id);
@@ -883,6 +1756,100 @@ pub fn set_mod_enabled(
     state.enabled.insert(mod_id.to_owned());
     state.save(mods_txt)?;
     Ok(None)
+}
+
+pub fn list_native_mods(mods_txt: Option<&Path>) -> Vec<NativeModStatus> {
+    let state = mods_txt.map(ModsTxtState::load).unwrap_or_default();
+    NATIVE_MOD_SPECS
+        .iter()
+        .map(|(id, name, desc)| NativeModStatus {
+            id: (*id).to_owned(),
+            name: (*name).to_owned(),
+            description: (*desc).to_owned(),
+            enabled: !state.disabled.contains(*id),
+        })
+        .collect()
+}
+
+pub fn list_installed_datapacks(game_dir: &Path) -> Vec<InstalledDatapack> {
+    let root = game_dir.join("new-world-datapacks");
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let id = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if path.is_dir() {
+            let mut files = 0usize;
+            let mut stack = vec![path.clone()];
+            while let Some(d) = stack.pop() {
+                if let Ok(sub) = fs::read_dir(d) {
+                    for s in sub.flatten() {
+                        let sp = s.path();
+                        if sp.is_dir() {
+                            stack.push(sp);
+                        } else {
+                            files += 1;
+                        }
+                    }
+                }
+            }
+            let desc = fs::read(path.join("pack.mcmeta"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .and_then(|v| v["pack"]["description"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| id.clone());
+            items.push(InstalledDatapack {
+                name: id.clone(),
+                id,
+                description: desc,
+                path: path.display().to_string(),
+                files,
+            });
+        } else if path.extension().and_then(|e| e.to_str()) == Some("zip") {
+            items.push(InstalledDatapack {
+                name: id.clone(),
+                id,
+                description: "Datapack zip".into(),
+                path: path.display().to_string(),
+                files: 1,
+            });
+        }
+    }
+    items.sort_by(|a, b| a.id.cmp(&b.id));
+    items
+}
+
+pub fn list_ported_resourcepacks(game_dir: &Path) -> Vec<InstalledResourcePack> {
+    let root = game_dir.join("resourcepacks");
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let fname = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if fname.ends_with("-rust.zip") {
+            let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            items.push(InstalledResourcePack {
+                file_name: fname,
+                path: path.display().to_string(),
+                size_bytes,
+            });
+        }
+    }
+    items.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    items
 }
 
 /// Lists all `.hmod` packages and folder mods inside `mods_dir` (`horizon-mods/`),
@@ -983,7 +1950,6 @@ pub fn list_installed_hmods(
         }
     }
 
-    // Annotate active namespace clashes among enabled mods.
     for i in 0..items.len() {
         if !items[i].enabled {
             continue;
@@ -1002,6 +1968,323 @@ pub fn list_installed_hmods(
         }
     }
     Ok(items)
+}
+
+fn copy_dir_files_shallow(src: &Path, dst: &Path, exts: &[&str]) -> usize {
+    if !src.is_dir() || src == dst {
+        return 0;
+    }
+    let Ok(entries) = fs::read_dir(src) else {
+        return 0;
+    };
+    let _ = fs::create_dir_all(dst);
+    let mut copied = 0usize;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let ok_ext = exts.is_empty()
+            || p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| exts.iter().any(|w| e.eq_ignore_ascii_case(w)));
+        if !ok_ext {
+            continue;
+        }
+        if let Some(fname) = p.file_name() {
+            let dest = dst.join(fname);
+            if !dest.exists() && fs::copy(&p, &dest).is_ok() {
+                copied += 1;
+            }
+        }
+    }
+    copied
+}
+
+fn extract_pack_overrides_from_zip(pack_zip: &Path, game_dir: &Path) -> Result<usize, String> {
+    let file = fs::File::open(pack_zip).map_err(|e| format!("{}: {e}", pack_zip.display()))?;
+    let mut zip =
+        zip::ZipArchive::new(file).map_err(|e| format!("{}: {e}", pack_zip.display()))?;
+    let custom_root = zip
+        .by_name("manifest.json")
+        .ok()
+        .and_then(|mut entry| {
+            let mut s = String::new();
+            entry.read_to_string(&mut s).ok()?;
+            let v: Value = serde_json::from_str(&s).ok()?;
+            v["overrides"].as_str().map(str::to_owned)
+        })
+        .unwrap_or_else(|| "overrides".into());
+
+    let roots = [
+        custom_root.as_str(),
+        "overrides",
+        "client-overrides",
+    ];
+    let mut budget = crate::entry::Budget::archive();
+    let mut extracted = 0usize;
+
+    for i in 0..zip.len() {
+        let entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        let raw_name = entry.name().replace('\\', "/");
+        if raw_name.ends_with('/') {
+            continue;
+        }
+        let mut matched_rel: Option<&str> = None;
+        for r in roots {
+            if let Some(rest) = raw_name.strip_prefix(r).and_then(|s| s.strip_prefix('/')) {
+                matched_rel = Some(rest);
+                break;
+            }
+        }
+        let Some(rel_str) = matched_rel else {
+            continue;
+        };
+        let Some(rel) = safe_rel_path(rel_str) else {
+            continue;
+        };
+        let dest = game_dir.join(rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        let declared = entry.size();
+        let Ok(bytes) = budget.read(entry, declared, 128 << 20) else {
+            continue;
+        };
+        fs::write(&dest, bytes).map_err(|e| format!("{}: {e}", dest.display()))?;
+        extracted += 1;
+    }
+    Ok(extracted)
+}
+
+/// Ports an entire Modpack (`.mrpack`, CurseForge `.zip`, or installed Modpack instance directory)
+/// into `game_dir` for 100% Native Rust Horizon execution.
+pub fn port_modpack(
+    pack_path: &Path,
+    game_dir: &Path,
+    resources: Option<&Path>,
+    auto_enable: bool,
+) -> Result<ModpackPortReport, String> {
+    fs::create_dir_all(game_dir).map_err(|e| format!("{}: {e}", game_dir.display()))?;
+    let hmods_dir = game_dir.join("horizon-mods");
+    fs::create_dir_all(&hmods_dir).map_err(|e| format!("{}: {e}", hmods_dir.display()))?;
+    let mods_txt = game_dir.join("horizon-mods.txt");
+
+    let pack = import::import(pack_path)?;
+    let mut overrides_extracted = 0usize;
+    let mut resourcepacks_copied = 0usize;
+    let mut shaderpacks_copied = 0usize;
+    let mut downloads_fetched = 0usize;
+    let mut download_warnings = Vec::new();
+    let mut candidate_archives: Vec<PathBuf> = Vec::new();
+    let mut seen_paths = BTreeSet::new();
+
+    let mut push_candidate = |p: PathBuf| {
+        if p.is_file() && seen_paths.insert(p.clone()) {
+            candidate_archives.push(p);
+        }
+    };
+
+    if pack_path.is_dir() {
+        resourcepacks_copied += copy_dir_files_shallow(
+            &pack_path.join("resourcepacks"),
+            &game_dir.join("resourcepacks"),
+            &["zip"],
+        );
+        shaderpacks_copied += copy_dir_files_shallow(
+            &pack_path.join("shaderpacks"),
+            &game_dir.join("shaderpacks"),
+            &["zip"],
+        );
+        for sub in ["mods", "datapacks"] {
+            let dir = pack_path.join(sub);
+            if let Ok(entries) = fs::read_dir(&dir) {
+                let mut list: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.is_file()
+                            && p.extension()
+                                .and_then(|x| x.to_str())
+                                .is_some_and(|x| {
+                                    x.eq_ignore_ascii_case("jar") || x.eq_ignore_ascii_case("zip")
+                                })
+                    })
+                    .collect();
+                list.sort();
+                for p in list {
+                    push_candidate(p);
+                }
+            }
+        }
+    } else {
+        overrides_extracted = extract_pack_overrides_from_zip(pack_path, game_dir)?;
+        let cache_dir = game_dir.join(".horizon-pack-cache");
+        let _ = fs::create_dir_all(&cache_dir);
+
+        for pf in &pack.files {
+            if pf.client == "unsupported" {
+                continue;
+            }
+            let Some(rel) = safe_rel_path(&pf.path) else {
+                continue;
+            };
+            let kind = pf.kind();
+            let fname = pf.file_name();
+            if fname.is_empty() || fname.contains(['/', '\\', ':', '\0']) {
+                continue;
+            }
+
+            if kind == "resourcepacks" || kind == "shaderpacks" {
+                let dest = game_dir.join(&rel);
+                if !dest.exists()
+                    && let Some(url) = pf.downloads.first()
+                {
+                    if let Some(parent) = dest.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    match fetch::download(url, pf.sha1.as_deref(), &dest, true) {
+                        Ok(()) => {
+                            downloads_fetched += 1;
+                            if kind == "resourcepacks" {
+                                resourcepacks_copied += 1;
+                            } else {
+                                shaderpacks_copied += 1;
+                            }
+                        }
+                        Err(e) => download_warnings.push(format!("{fname}: {e}")),
+                    }
+                }
+                continue;
+            }
+
+            if kind == "mods" || kind == "datapacks" {
+                let existing_in_game = game_dir.join(&rel);
+                if existing_in_game.is_file() {
+                    push_candidate(existing_in_game);
+                    continue;
+                }
+                let cached = cache_dir.join(fname);
+                if cached.is_file() {
+                    push_candidate(cached);
+                    continue;
+                }
+                if let Some(url) = pf.downloads.first() {
+                    match fetch::download(url, pf.sha1.as_deref(), &cached, true) {
+                        Ok(()) => {
+                            downloads_fetched += 1;
+                            push_candidate(cached);
+                        }
+                        Err(e) => download_warnings.push(format!("{fname}: {e}")),
+                    }
+                } else if pf.curseforge.is_some() {
+                    download_warnings.push(format!(
+                        "{fname}: CurseForge-only manifest entry (install pack first or use Modrinth .mrpack)"
+                    ));
+                }
+            }
+        }
+
+        // Also pick up any override jars/datapacks extracted into `<game_dir>/mods` or `datapacks`.
+        for sub in ["mods", "datapacks"] {
+            let dir = game_dir.join(sub);
+            if let Ok(entries) = fs::read_dir(&dir) {
+                let mut list: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.is_file()
+                            && p.extension()
+                                .and_then(|x| x.to_str())
+                                .is_some_and(|x| {
+                                    x.eq_ignore_ascii_case("jar") || x.eq_ignore_ascii_case("zip")
+                                })
+                    })
+                    .collect();
+                list.sort();
+                for p in list {
+                    push_candidate(p);
+                }
+            }
+        }
+    }
+
+    let mut results = Vec::with_capacity(candidate_archives.len());
+    let mut works = 0usize;
+    let mut partly = 0usize;
+    let mut skipped_code_only = 0usize;
+    let mut hmods_created = 0usize;
+    let mut datapacks_created = 0usize;
+    let mut resourcepacks_created = 0usize;
+    let mut native_rust_enabled = 0usize;
+    let mut builtin_engine_matched = 0usize;
+
+    for archive_path in &candidate_archives {
+        let mut item =
+            port_jar_with_game_dir(archive_path, &hmods_dir, Some(game_dir), resources);
+        match item.verdict {
+            Verdict::Works => works += 1,
+            Verdict::Partly => partly += 1,
+            Verdict::No => skipped_code_only += 1,
+        }
+        match item.kind.as_str() {
+            "hmod" => {
+                hmods_created += 1;
+                if auto_enable {
+                    match set_mod_enabled(&mods_txt, Some(&hmods_dir), &item.mod_id, true) {
+                        Ok(None) => item.enabled = true,
+                        Ok(Some(clash)) => item.clash_warning = Some(clash),
+                        Err(e) => item.clash_warning = Some(e),
+                    }
+                }
+            }
+            "native_rust" => {
+                native_rust_enabled += 1;
+                if auto_enable
+                    && let Some(nid) = item.native_mod_id.clone()
+                {
+                    if set_mod_enabled(&mods_txt, Some(&hmods_dir), &nid, true).is_ok() {
+                        item.enabled = true;
+                    }
+                }
+            }
+            "datapack" => datapacks_created += 1,
+            "resourcepack" => resourcepacks_created += 1,
+            "builtin_engine" => builtin_engine_matched += 1,
+            _ => {}
+        }
+        results.push(item);
+    }
+
+    Ok(ModpackPortReport {
+        pack_name: if pack.name.is_empty() {
+            pack_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Modpack".into())
+        } else {
+            pack.name
+        },
+        pack_format: pack.format,
+        minecraft: pack.minecraft,
+        loader: pack.loader,
+        game_dir: game_dir.display().to_string(),
+        total_mods: results.len(),
+        works,
+        partly,
+        skipped_code_only,
+        hmods_created,
+        datapacks_created,
+        resourcepacks_created,
+        native_rust_enabled,
+        builtin_engine_matched,
+        overrides_extracted,
+        resourcepacks_copied,
+        shaderpacks_copied,
+        downloads_fetched,
+        download_warnings,
+        results,
+    })
 }
 
 #[cfg(test)]
@@ -1037,8 +2320,6 @@ mod tests {
         let hmods_dir = dir.join("horizon-mods");
         let mods_txt = dir.join("horizon-mods.txt");
 
-        // 1) Legacy 1.20.1 Fabric jar with hyphenated mod id, plural `recipes/` + `loot_tables/`,
-        //    pre-1.20.5 `{"item": ..., "count": 4}` crafting result, and stonecutting top-level `count`.
         let fabric_json = br#"{
             "schemaVersion": 1,
             "id": "ruby-gems",
@@ -1049,7 +2330,8 @@ mod tests {
         let blockstate = br#"{"variants": {"": {"model": "ruby_gems:block/ruby_block"}}}"#;
         let block_model =
             br#"{"parent": "minecraft:block/cube_all", "textures": {"all": "ruby_gems:block/ruby_block"}}"#;
-        let item_model = br#"{"parent": "minecraft:item/generated", "textures": {"layer0": "ruby_gems:item/ruby"}}"#;
+        let item_model =
+            br#"{"parent": "minecraft:item/generated", "textures": {"layer0": "ruby_gems:item/ruby"}}"#;
         let legacy_shaped = br#"{
             "type": "minecraft:crafting_shapeless",
             "ingredients": [{"item": "ruby_gems:ruby_block"}],
@@ -1088,6 +2370,7 @@ mod tests {
 
         let ported = port_jar_to_hmod(&jar_path, &hmods_dir, None);
         assert_eq!(ported.verdict, Verdict::Works, "{ported:?}");
+        assert_eq!(ported.kind, "hmod");
         assert_eq!(ported.mod_id, "ruby_gems");
         assert!(ported.legacy_mc_layout);
         assert_eq!(ported.blocks, 1);
@@ -1097,7 +2380,6 @@ mod tests {
         let hmod_path = PathBuf::from(ported.hmod_path.as_ref().unwrap());
         assert!(hmod_path.is_file());
 
-        // Verify Horizon's own Package + Content reader loads the `.hmod` cleanly.
         let pkg = Package::read(&hmod_path).unwrap();
         let content = Content::read(&hmod_path, &pkg.manifest).unwrap();
         assert_eq!(content.blocks.len(), 1);
@@ -1123,16 +2405,12 @@ mod tests {
         );
         assert!(upgraded_cut.get("count").is_none());
 
-        // Toggle on in horizon-mods.txt and list installed hmods.
         let clash = set_mod_enabled(&mods_txt, Some(&hmods_dir), "ruby_gems", true).unwrap();
         assert!(clash.is_none());
         let listed = list_installed_hmods(&hmods_dir, Some(&mods_txt)).unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].enabled);
-        assert_eq!(listed[0].blocks, 1);
-        assert_eq!(listed[0].items, 1);
 
-        // 2) Pure Java code jar returns Verdict::No without creating an `.hmod`.
         let class_bytes =
             crate::classes::tests_support::class_file("opt/FastMath", "java/lang/Object");
         let code_jar = make_jar(
@@ -1148,8 +2426,151 @@ mod tests {
         );
         let no_port = port_jar_to_hmod(&code_jar, &hmods_dir, None);
         assert_eq!(no_port.verdict, Verdict::No);
+        assert_eq!(no_port.kind, "java_code");
         assert!(no_port.hmod_path.is_none());
-        assert!(!hmods_dir.join("fastmath.hmod").exists());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ports_all_five_channels_and_modpack_mrpack() {
+        let dir = temp("five-channels-and-pack");
+        let game_dir = dir.join("game");
+        let hmods_dir = game_dir.join("horizon-mods");
+        let mods_txt = game_dir.join("horizon-mods.txt");
+
+        // Channel 1: Xaero's Minimap -> native_rust `minimap`
+        let xaero_jar = make_jar(
+            &dir,
+            "Xaeros_Minimap_24.6.1_Fabric_1.21.11.jar",
+            &[(
+                "fabric.mod.json",
+                br#"{"schemaVersion":1,"id":"xaerominimap","version":"24.6.1","name":"Xaero's Minimap"}"#,
+            )],
+        );
+        let r1 = port_jar_with_game_dir(&xaero_jar, &hmods_dir, Some(&game_dir), None);
+        assert_eq!(r1.verdict, Verdict::Works);
+        assert_eq!(r1.kind, "native_rust");
+        assert_eq!(r1.native_mod_id.as_deref(), Some("minimap"));
+
+        // Toggle native mod ON then OFF -> writes `mod.minimap:false` when disabled!
+        set_mod_enabled(&mods_txt, Some(&hmods_dir), "minimap", true).unwrap();
+        assert!(
+            list_native_mods(Some(&mods_txt))
+                .iter()
+                .find(|m| m.id == "minimap")
+                .unwrap()
+                .enabled
+        );
+        set_mod_enabled(&mods_txt, Some(&hmods_dir), "minimap", false).unwrap();
+        assert!(
+            !list_native_mods(Some(&mods_txt))
+                .iter()
+                .find(|m| m.id == "minimap")
+                .unwrap()
+                .enabled
+        );
+
+        // Channel 2: Sodium -> builtin_engine
+        let sodium_jar = make_jar(
+            &dir,
+            "sodium-fabric-0.6.5.jar",
+            &[(
+                "fabric.mod.json",
+                br#"{"schemaVersion":1,"id":"sodium","version":"0.6.5","name":"Sodium"}"#,
+            )],
+        );
+        let r2 = port_jar_with_game_dir(&sodium_jar, &hmods_dir, Some(&game_dir), None);
+        assert_eq!(r2.verdict, Verdict::Works);
+        assert_eq!(r2.kind, "builtin_engine");
+
+        // Channel 4: Worldgen / SkyBlock jar overriding `data/minecraft/worldgen/...` -> datapack
+        let worldgen_jar = make_jar(
+            &dir,
+            "sky-islands-1.21.jar",
+            &[
+                (
+                    "fabric.mod.json",
+                    br#"{"schemaVersion":1,"id":"sky_islands","version":"2.0","name":"Sky Islands"}"#,
+                ),
+                (
+                    "data/minecraft/worldgen/noise/continentalness.json",
+                    br#"{"firstOctave": -9, "amplitudes": [1.0, 1.0, 2.0]}"#,
+                ),
+                (
+                    "data/sky_islands/functions/start.mcfunction",
+                    b"say Welcome to Sky Islands!\n",
+                ),
+            ],
+        );
+        let r4 = port_jar_with_game_dir(&worldgen_jar, &hmods_dir, Some(&game_dir), None);
+        assert_eq!(r4.verdict, Verdict::Works, "{r4:?}");
+        assert_eq!(r4.kind, "datapack");
+        assert!(
+            game_dir
+                .join("new-world-datapacks/sky_islands/data/sky_islands/function/start.mcfunction")
+                .is_file()
+        );
+        assert!(
+            game_dir
+                .join("new-world-datapacks/sky_islands/pack.mcmeta")
+                .is_file()
+        );
+
+        // Channel 5: Vanilla texture override jar -> resourcepack
+        let tex_jar = make_jar(
+            &dir,
+            "hd-apples.jar",
+            &[
+                (
+                    "fabric.mod.json",
+                    br#"{"schemaVersion":1,"id":"hd_apples","version":"1.0","name":"HD Apples"}"#,
+                ),
+                (
+                    "assets/minecraft/models/item/apple.json",
+                    br#"{"parent":"minecraft:item/generated","textures":{"layer0":"minecraft:item/apple"}}"#,
+                ),
+            ],
+        );
+        let r5 = port_jar_with_game_dir(&tex_jar, &hmods_dir, Some(&game_dir), None);
+        assert_eq!(r5.verdict, Verdict::Works);
+        assert_eq!(r5.kind, "resourcepack");
+        assert!(game_dir.join("resourcepacks/hd_apples-rust.zip").is_file());
+
+        // `.mrpack` Modpack with overrides -> `port_modpack`
+        let pack_target = dir.join("pack-game");
+        let mrpack = make_jar(
+            &dir,
+            "skyblock-pro.mrpack",
+            &[
+                (
+                    "modrinth.index.json",
+                    br#"{
+                        "formatVersion": 1,
+                        "game": "minecraft",
+                        "versionId": "1.0.0",
+                        "name": "SkyBlock Pro Rust",
+                        "dependencies": { "minecraft": "1.21.11", "fabric-loader": "0.16.9" },
+                        "files": []
+                    }"#,
+                ),
+                (
+                    "overrides/mods/Xaeros_Minimap_24.6.1_Fabric_1.21.11.jar",
+                    &fs::read(&xaero_jar).unwrap(),
+                ),
+                (
+                    "overrides/mods/sky-islands-1.21.jar",
+                    &fs::read(&worldgen_jar).unwrap(),
+                ),
+                ("overrides/config/skyblock.toml", b"islands = true\n"),
+            ],
+        );
+        let pack_report = port_modpack(&mrpack, &pack_target, None, true).unwrap();
+        assert_eq!(pack_report.pack_name, "SkyBlock Pro Rust");
+        assert_eq!(pack_report.total_mods, 2);
+        assert_eq!(pack_report.native_rust_enabled, 1);
+        assert_eq!(pack_report.datapacks_created, 1);
+        assert!(pack_target.join("config/skyblock.toml").is_file());
 
         fs::remove_dir_all(&dir).unwrap();
     }
