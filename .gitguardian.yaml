@@ -1,0 +1,11 @@
+version: 2
+secret:
+  ignored_paths:
+    - "tools/test_*.py"
+    - "tools/*_e2e.py"
+    - "crates/**/tests/**"
+    - "crates/**/*_tests.rs"
+    - "launcher/src/**/tests.rs"
+    - "mods/**/src/test/**"
+    - "third_party/**"
+    - "docs/**"
