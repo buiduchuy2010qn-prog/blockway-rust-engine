@@ -885,29 +885,80 @@ fn maybe_extract_nested_content_jar(outer_path: &Path, names: &[String], work_di
     Some(out)
 }
 
-fn needs_26_3_worldgen_upgrade(files: &BTreeMap<String, Vec<u8>>) -> bool {
-    for (path, bytes) in files {
-        if path.contains("/configured_feature/") || path.contains("/configured_carver/") {
-            return true;
+fn pack_declares_26_3_format(files: &BTreeMap<String, Vec<u8>>) -> bool {
+    let Some(bytes) = files.get("pack.mcmeta") else {
+        return false;
+    };
+    let clean = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let Ok(v) = serde_json::from_slice::<Value>(clean) else {
+        return false;
+    };
+    let Some(pack) = v.get("pack") else {
+        return false;
+    };
+    let fmt_ge_26_3 = |val: Option<&Value>| -> bool {
+        match val {
+            Some(Value::Number(n)) => n.as_u64().is_some_and(|f| f >= upgrade::PACK_FORMAT),
+            Some(Value::Array(arr)) => arr
+                .first()
+                .and_then(Value::as_u64)
+                .is_some_and(|f| f >= upgrade::PACK_FORMAT),
+            _ => false,
         }
-        if !path.ends_with(".json") || !path.starts_with("data/") {
+    };
+    fmt_ge_26_3(pack.get("min_format")) || fmt_ge_26_3(pack.get("pack_format"))
+}
+
+fn needs_26_3_worldgen_upgrade(files: &BTreeMap<String, Vec<u8>>) -> bool {
+    if pack_declares_26_3_format(files) {
+        return false;
+    }
+    for (path, bytes) in files {
+        if !path.ends_with(".json") || !path.starts_with("data/") || path.contains("/tags/") {
             continue;
         }
-        let Ok(v) = serde_json::from_slice::<Value>(bytes) else {
+        if path.contains("/worldgen/configured_feature/")
+            || path.contains("/worldgen/configured_carver/")
+        {
+            return true;
+        }
+        let clean = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+        let Ok(v) = serde_json::from_slice::<Value>(clean) else {
             continue;
         };
-        if path.contains("/worldgen/noise/") && v.get("firstOctave").is_some() && v.get("amplitudes").is_some() && v.get("base_amplitude").is_none() {
+        if path.contains("/worldgen/noise/")
+            && v.get("firstOctave").is_some()
+            && v.get("amplitudes").is_some()
+            && v.get("base_amplitude").is_none()
+        {
             return true;
         }
-        if path.contains("/worldgen/biome/") && v.get("spawners").is_some() {
+        if path.contains("/worldgen/biome/")
+            && (v.get("spawners").is_some()
+                || v.get("carvers").is_some_and(Value::is_object)
+                || v.pointer("/effects/sky_color").is_some())
+        {
             return true;
         }
-        if path.contains("/worldgen/noise_settings/") && v.get("surface_rule").is_some() {
+        if path.contains("/worldgen/noise_settings/")
+            && (v.get("surface_rule").is_some()
+                || (v.get("material_rule").is_none()
+                    && v.pointer("/noise/size_horizontal").is_some()))
+        {
             return true;
         }
         if path.contains("/worldgen/density_function/")
-            && let Ok(txt) = std::str::from_utf8(bytes)
-            && (txt.contains("\"argument1\"") || txt.contains("\"argument2\""))
+            && let Ok(txt) = std::str::from_utf8(clean)
+            && (txt.contains("\"argument\"")
+                || txt.contains("\"argument1\"")
+                || txt.contains("\"argument2\"")
+                || txt.contains("y_clamped_gradient")
+                || txt.contains("flat_cache")
+                || txt.contains("cache_2d")
+                || txt.contains("cache_once")
+                || txt.contains("cache_all_in_cell")
+                || txt.contains("shifted_noise")
+                || txt.contains("weird_scaled_sampler"))
         {
             return true;
         }
@@ -2580,6 +2631,54 @@ mod tests {
         assert_eq!(pack_report.native_rust_enabled, 1);
         assert_eq!(pack_report.datapacks_created, 1);
         assert!(pack_target.join("config/skyblock.toml").is_file());
+
+        // Native 26.3 datapack (e.g. Terralith 26.3) with configured_feature tag must NOT
+        // null out 26.3 density_function `left`/`right`/`input` fields!
+        let native_26_3_dp = make_jar(
+            &dir,
+            "Terralith_v2.6.5+26.3.zip",
+            &[
+                (
+                    "pack.mcmeta",
+                    br#"{"pack":{"description":"Terralith 26.3","min_format":121,"max_format":121}}"#,
+                ),
+                (
+                    "data/minecraft/tags/worldgen/configured_feature/can_spawn_from_bone_meal.json",
+                    br#"{"values":["minecraft:oak"]}"#,
+                ),
+                (
+                    "data/minecraft/worldgen/density_function/overworld/final_density.json",
+                    br#"{"type":"minecraft:add","left":"minecraft:beardifier","right":{"type":"minecraft:cache","input":{"type":"minecraft:interpolated","cell_size_xz":4,"cell_size_y":8,"input":{"type":"minecraft:abs","input":0.5}}}}"#,
+                ),
+            ],
+        );
+        let r_dp = port_jar_with_game_dir(&native_26_3_dp, &hmods_dir, Some(&game_dir), None);
+        assert_eq!(r_dp.verdict, Verdict::Works, "{r_dp:?}");
+        assert_eq!(r_dp.kind, "datapack");
+        let out_df = fs::read_to_string(
+            game_dir.join(format!(
+                "new-world-datapacks/{}/data/minecraft/worldgen/density_function/overworld/final_density.json",
+                r_dp.mod_id
+            )),
+        )
+        .unwrap();
+        assert!(!out_df.contains("null"), "corrupted 26.3 density_function: {out_df}");
+        let parsed_df: Value = serde_json::from_str(&out_df).unwrap();
+        assert_eq!(parsed_df["left"], "minecraft:beardifier");
+        assert_eq!(parsed_df["right"]["input"]["cell_size_xz"], 4);
+
+        // Also ensure `upgrade::upgrade_pack` itself is idempotent on 26.3 density functions
+        let mut raw_map = BTreeMap::new();
+        raw_map.insert(
+            "data/minecraft/worldgen/density_function/overworld/final_density.json".to_string(),
+            out_df.into_bytes(),
+        );
+        let (upgraded_again, _) = upgrade::upgrade_pack(&raw_map);
+        let again_txt = String::from_utf8(
+            upgraded_again["data/minecraft/worldgen/density_function/overworld/final_density.json"].clone(),
+        )
+        .unwrap();
+        assert!(!again_txt.contains("null"), "idempotency broken: {again_txt}");
 
         fs::remove_dir_all(&dir).unwrap();
     }

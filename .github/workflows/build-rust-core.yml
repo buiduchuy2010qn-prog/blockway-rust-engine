@@ -43,6 +43,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked -p horizon-core --lib version_profile
+          cargo test --locked -p horizon-threads --lib
           cargo test --locked -p horizon-client --lib blockway_native_mods
           cargo test --locked -p horizon-port-pack --lib port_jar
 
@@ -85,7 +86,7 @@ jobs:
           out_dir = pathlib.Path("dist/horizon-windows-x64")
           meta = {
               "engine": "blockway-rust",
-              "version": "2.0.0",
+              "version": "2.1.0",
               "commit": os.environ["GITHUB_SHA"],
               "shortCommit": os.environ["SHORT_SHA"],
               "builtAt": os.environ["BUILT_AT"],

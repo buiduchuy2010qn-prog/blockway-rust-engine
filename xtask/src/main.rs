@@ -264,13 +264,19 @@ fn copy_exporter_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// `OUT`, emptied, with the sources the release folders take (`ARCHIVED`); the repository's path.
+/// `OUT`, emptied, with the sources the release folders take (`ARCHIVED`); the workspace's path.
 fn new_folder(out: &Path) -> Result<PathBuf, String> {
-    let top = git(
-        Path::new(env!("CARGO_MANIFEST_DIR")),
-        &["rev-parse", "--show-toplevel"],
-    )?;
-    let repo = PathBuf::from(String::from_utf8_lossy(&top).trim());
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| "missing workspace root".to_string())?
+        .to_path_buf();
+    let top_raw = git(&repo, &["rev-parse", "--show-toplevel"])?;
+    let top = PathBuf::from(String::from_utf8_lossy(&top_raw).trim());
+    let prefix_raw = git(&repo, &["rev-parse", "--show-prefix"])?;
+    let prefix = String::from_utf8_lossy(&prefix_raw)
+        .trim()
+        .trim_matches('/')
+        .to_string();
     match fs::remove_dir_all(out) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             return Err(format!("{}: {e}", out.display()));
@@ -278,9 +284,14 @@ fn new_folder(out: &Path) -> Result<PathBuf, String> {
         _ => {}
     }
     fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
-    let mut args = vec!["archive", "--format=tar", "HEAD"];
+    let treeish = if prefix.is_empty() {
+        "HEAD".to_string()
+    } else {
+        format!("HEAD:{prefix}")
+    };
+    let mut args = vec!["archive", "--format=tar", treeish.as_str()];
     args.extend(ARCHIVED);
-    extract(&git(&repo, &args)?, out)?;
+    extract(&git(&top, &args)?, out)?;
     Ok(repo)
 }
 

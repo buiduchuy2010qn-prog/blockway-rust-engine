@@ -105,10 +105,29 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.proc-macro2]
 opt-level = 3
+[profile.release.package.horizon-threads]
+opt-level = 3
+[profile.release.package.horizon-client-render]
+opt-level = 3
+[profile.release.package.horizon-world]
+opt-level = 3
+[profile.release.package.horizon-game]
+opt-level = 3
+[profile.release.package.horizon-client]
+opt-level = 3
+[profile.release.package.horizon-client-core]
+opt-level = 3
+[profile.release.package.horizon-protocol]
+opt-level = 3
+[profile.release.package.horizon-assets]
+opt-level = 3
+[profile.release.package.horizon-shaders]
+opt-level = 3
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
+strip = "debuginfo"
 
 # Optimized but quick-to-link builds for iteration: cargo build --profile fast
 [profile.fast]
@@ -116,3 +135,4 @@ inherits = "release"
 lto = false
 codegen-units = 16
 incremental = true
+strip = "none"

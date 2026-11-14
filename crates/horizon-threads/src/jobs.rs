@@ -72,7 +72,7 @@ pub trait Source: Send + Sync {
 }
 
 /// How long a worker waits with no job before it frees its buffers.
-pub const IDLE_RELEASE: Duration = Duration::from_secs(5);
+pub const IDLE_RELEASE: Duration = Duration::from_secs(3);
 
 /// Per-worker state for a source: worker `i` only ever touches slot `i`, so
 /// the locks are never contended. The source owns it, so it goes with the source.
@@ -222,6 +222,7 @@ impl Pool {
             let worker = inner.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("{name}-{i}"))
+                .stack_size(1024 * 1024)
                 .spawn(move || {
                     // Ticks and frames come first.
                     crate::behind_server();

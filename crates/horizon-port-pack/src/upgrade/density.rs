@@ -127,28 +127,37 @@ impl<'a> Context<'a> {
             return v.clone();
         };
         let arg = |name: &str| o.get(name).cloned().unwrap_or(Value::Null);
+        let arg_or = |a: &str, b: &str| {
+            o.get(a)
+                .or_else(|| o.get(b))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
         let unary = |this: &mut Self, report: &mut Report, to: &str| {
-            let input = this.density(&arg("argument"), report);
+            let input = this.density(&arg_or("argument", "input"), report);
             json!({"type": format!("minecraft:{to}"), "input": input})
         };
         match t {
-            "abs" | "square" | "cube" | "half_negative" | "quarter_negative" | "squeeze"
-            | "blend_density" => unary(self, report, t),
+            "abs" | "square" | "cube" | "sqrt" | "half_negative" | "quarter_negative"
+            | "squeeze" | "blend_density" | "cache" | "reciprocal" | "negate" | "log"
+            | "sign" => unary(self, report, t),
             "invert" => unary(self, report, "reciprocal"),
-            "add" | "mul" | "min" | "max" => {
-                let left = self.density(&arg("argument1"), report);
-                let right = self.density(&arg("argument2"), report);
+            "add" | "sub" | "mul" | "div" | "min" | "max" => {
+                let left = self.density(&arg_or("argument1", "left"), report);
+                let right = self.density(&arg_or("argument2", "right"), report);
                 json!({"type": format!("minecraft:{t}"), "left": left, "right": right})
             }
             "interpolated" => {
-                let input = self.density(&arg("argument"), report);
-                json!({"type": "minecraft:interpolated", "cell_size_xz": self.cell.0,
-                    "cell_size_y": self.cell.1, "input": input})
+                let input = self.density(&arg_or("argument", "input"), report);
+                let xz = o.get("cell_size_xz").and_then(Value::as_i64).unwrap_or(self.cell.0);
+                let y = o.get("cell_size_y").and_then(Value::as_i64).unwrap_or(self.cell.1);
+                json!({"type": "minecraft:interpolated", "cell_size_xz": xz,
+                    "cell_size_y": y, "input": input})
             }
             // 26.2's flat cache holds the value at y = 0 of each column
             // inside the chunk; 26.3's cache only memoises.
             "flat_cache" => {
-                let raw = arg("argument");
+                let raw = arg_or("argument", "input");
                 let input = self.density(&raw, report);
                 let input = if self.depends_on_y(&raw, &mut BTreeSet::new()) {
                     json!({"type": "minecraft:slice", "axis": "y", "coordinate": 0, "input": input})
@@ -158,7 +167,7 @@ impl<'a> Context<'a> {
                 json!({"type": "minecraft:cache", "input": input})
             }
             "cache_2d" | "cache_once" | "cache_all_in_cell" => {
-                let raw = arg("argument");
+                let raw = arg_or("argument", "input");
                 if t == "cache_2d" && self.depends_on_y(&raw, &mut BTreeSet::new()) {
                     report.lossy("density: cache_2d around a function of y");
                 }
@@ -183,6 +192,11 @@ impl<'a> Context<'a> {
             "noise" => {
                 let mut n = o.clone();
                 n.insert("noise".into(), noise_holder(&arg("noise"), report));
+                for key in ["shift_x", "shift_y", "shift_z"] {
+                    if let Some(x) = o.get(key) {
+                        n.insert(key.into(), self.density(x, report));
+                    }
+                }
                 Value::Object(n)
             }
             "shifted_noise" => {
@@ -200,7 +214,7 @@ impl<'a> Context<'a> {
                 Value::Object(n)
             }
             "shift_a" | "shift_b" | "shift" => {
-                json!({"type": format!("minecraft:{t}"), "noise": noise_holder(&arg("argument"), report)})
+                json!({"type": format!("minecraft:{t}"), "noise": noise_holder(&arg_or("argument", "noise"), report)})
             }
             // 1.21.1's `RarityValueMapper` scales, as 26.3's own caves spell
             // them: |noise(p / s) * s| with s chosen by the input's interval.
@@ -222,9 +236,10 @@ impl<'a> Context<'a> {
                 json!({"type": "minecraft:abs", "input": {"type": "minecraft:interval_select",
                     "input": input, "thresholds": thresholds, "functions": functions}})
             }
-            "end_islands" => json!({"type": "minecraft:end_outer_islands"}),
-            "constant" => arg("argument"),
-            "clamp" | "range_choice" | "find_top_surface" | "interval_select" => {
+            "end_islands" | "end_outer_islands" => json!({"type": "minecraft:end_outer_islands"}),
+            "constant" => o.get("argument").cloned().unwrap_or_else(|| v.clone()),
+            "clamp" | "range_choice" | "find_top_surface" | "interval_select" | "slice"
+            | "pow" | "floor" | "round" | "ceil" | "truncate" | "lerp" => {
                 let mut n = o.clone();
                 for key in [
                     "input",
@@ -232,6 +247,12 @@ impl<'a> Context<'a> {
                     "when_out_of_range",
                     "density",
                     "upper_bound",
+                    "base",
+                    "exponent",
+                    "multiple",
+                    "alpha",
+                    "first",
+                    "second",
                 ] {
                     if let Some(x) = o.get(key) {
                         n.insert(key.into(), self.density(x, report));
@@ -247,7 +268,7 @@ impl<'a> Context<'a> {
                 let spline = self.spline(&arg("spline"), report);
                 json!({"type": "minecraft:spline", "spline": spline})
             }
-            "old_blended_noise" | "blend_alpha" | "blend_offset" | "beardifier" => v.clone(),
+            "old_blended_noise" | "blend_alpha" | "blend_offset" | "beardifier" | "gradient" => v.clone(),
             other => {
                 report.unknown(format!("density function {other}"));
                 v.clone()

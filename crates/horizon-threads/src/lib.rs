@@ -154,6 +154,7 @@ fn workers_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usi
 /// - on Apple silicon via `hw.perflevel0.physicalcpu`
 /// - on Linux by comparing max frequencies in `/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq`
 ///   (Intel Alder Lake, Raptor Lake, Meteor Lake, big.LITTLE ARM)
+/// - on Windows via `GetLogicalProcessorInformationEx(RelationProcessorCore)` efficiency classes
 #[cfg(target_vendor = "apple")]
 fn performance_cores() -> Option<usize> {
     let mut count: libc::c_int = 0;
@@ -208,7 +209,125 @@ fn performance_cores() -> Option<usize> {
     None
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+#[cfg(windows)]
+fn kernel32_proc(name: &std::ffi::CStr) -> Option<*mut std::ffi::c_void> {
+    use std::ffi::{c_char, c_void};
+    unsafe extern "system" {
+        fn GetModuleHandleA(name: *const c_char) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+    }
+    // SAFETY: kernel32.dll is loaded in every process; `name` is NUL-terminated.
+    let func = unsafe {
+        let kernel32 = GetModuleHandleA(c"kernel32.dll".as_ptr());
+        if kernel32.is_null() {
+            return None;
+        }
+        GetProcAddress(kernel32, name.as_ptr())
+    };
+    (!func.is_null()).then_some(func)
+}
+
+#[cfg(windows)]
+fn parse_windows_performance_cores(buf: &[u8]) -> Option<usize> {
+    const RELATION_PROCESSOR_CORE: u32 = 0;
+    const MASK_BYTES: usize = core::mem::size_of::<usize>();
+    const GROUP_AFFINITY_BYTES: usize = MASK_BYTES + 8;
+
+    let mut cores: Vec<(u8, usize)> = Vec::new();
+    let mut min_eff = u8::MAX;
+    let mut max_eff = u8::MIN;
+    let mut total_threads: usize = 0;
+    let mut offset: usize = 0;
+
+    while offset + 8 <= buf.len() {
+        let header = &buf[offset..offset + 8];
+        let relationship = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        if size < 8 || offset.checked_add(size).is_none_or(|end| end > buf.len()) {
+            break;
+        }
+        let rec = &buf[offset..offset + size];
+        offset += size;
+
+        if relationship == RELATION_PROCESSOR_CORE && rec.len() >= 32 {
+            let efficiency_class = rec[9];
+            let group_count = u16::from_le_bytes([rec[30], rec[31]]) as usize;
+            let mut core_threads: usize = 0;
+            for i in 0..group_count {
+                let Some(entry_start) = 32usize.checked_add(i.saturating_mul(GROUP_AFFINITY_BYTES))
+                else {
+                    break;
+                };
+                let Some(entry_end) = entry_start.checked_add(GROUP_AFFINITY_BYTES) else {
+                    break;
+                };
+                if entry_end > rec.len() {
+                    break;
+                }
+                let Ok(mask_bytes) = <[u8; MASK_BYTES]>::try_from(
+                    &rec[entry_start..entry_start + MASK_BYTES],
+                ) else {
+                    break;
+                };
+                core_threads += usize::from_le_bytes(mask_bytes).count_ones() as usize;
+            }
+            if core_threads > 0 {
+                min_eff = min_eff.min(efficiency_class);
+                max_eff = max_eff.max(efficiency_class);
+                total_threads += core_threads;
+                cores.push((efficiency_class, core_threads));
+            }
+        }
+    }
+
+    if cores.is_empty() || min_eff >= max_eff {
+        return None;
+    }
+
+    let p_threads: usize = cores
+        .iter()
+        .filter(|&&(eff, _)| eff == max_eff)
+        .map(|&(_, threads)| threads)
+        .sum();
+
+    if 0 < p_threads && p_threads < total_threads {
+        Some(p_threads)
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn performance_cores() -> Option<usize> {
+    use std::ffi::c_void;
+    type GetLogicalProcessorInformationEx =
+        unsafe extern "system" fn(u32, *mut u8, *mut u32) -> i32;
+    const RELATION_PROCESSOR_CORE: u32 = 0;
+    static P_CORES: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+
+    *P_CORES.get_or_init(|| {
+        let func = kernel32_proc(c"GetLogicalProcessorInformationEx")?;
+        // SAFETY: `func` was resolved from kernel32 for `GetLogicalProcessorInformationEx`.
+        let get_info = unsafe {
+            std::mem::transmute::<*mut c_void, GetLogicalProcessorInformationEx>(func)
+        };
+        let mut byte_len: u32 = 0;
+        // SAFETY: querying required buffer length with null buffer and `&mut byte_len`.
+        let _ = unsafe { get_info(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut byte_len) };
+        if byte_len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; byte_len as usize];
+        // SAFETY: `buf` is at least `byte_len` bytes long and writable.
+        if unsafe { get_info(RELATION_PROCESSOR_CORE, buf.as_mut_ptr(), &mut byte_len) } == 0 {
+            return None;
+        }
+        let len = (byte_len as usize).min(buf.len());
+        parse_windows_performance_cores(&buf[..len])
+    })
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", windows)))]
 fn performance_cores() -> Option<usize> {
     None
 }
@@ -244,10 +363,78 @@ fn favour() -> bool {
 }
 
 #[cfg(windows)]
+#[repr(C)]
+struct PowerThrottlingState {
+    version: u32,
+    control_mask: u32,
+    state_mask: u32,
+}
+
+#[cfg(windows)]
+unsafe fn set_power_throttling(
+    proc_name: &std::ffi::CStr,
+    handle: *mut std::ffi::c_void,
+    info_class: u32,
+) -> bool {
+    use std::ffi::c_void;
+    type SetInfoFn = unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32) -> i32;
+    let Some(func) = kernel32_proc(proc_name) else {
+        return false;
+    };
+    // SAFETY: `func` was resolved from kernel32 for `SetThreadInformation` or
+    // `SetProcessInformation`, which share this exact ABI signature.
+    let set_info = unsafe { std::mem::transmute::<*mut c_void, SetInfoFn>(func) };
+    let mut state = PowerThrottlingState {
+        version: 1,
+        control_mask: 0x1,
+        state_mask: 0,
+    };
+    // SAFETY: caller guarantees `handle` is valid and `info_class` expects `PowerThrottlingState`.
+    unsafe {
+        set_info(
+            handle,
+            info_class,
+            (&raw mut state).cast(),
+            core::mem::size_of::<PowerThrottlingState>() as u32,
+        ) != 0
+    }
+}
+
+/// Ask Windows 11's scheduler not to demote the calling thread to EcoQoS
+/// (efficiency cores / throttled clock).
+#[cfg(windows)]
+pub fn disable_thread_power_throttling() -> bool {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, ThreadPowerThrottling};
+    // SAFETY: `GetCurrentThread()` returns a pseudo-handle to the calling thread.
+    unsafe {
+        set_power_throttling(
+            c"SetThreadInformation",
+            GetCurrentThread(),
+            ThreadPowerThrottling as u32,
+        )
+    }
+}
+
+/// Ask Windows 11's scheduler not to apply process-wide EcoQoS power throttling.
+#[cfg(windows)]
+pub fn disable_process_power_throttling() -> bool {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, ProcessPowerThrottling};
+    // SAFETY: `GetCurrentProcess()` returns a pseudo-handle to the current process.
+    unsafe {
+        set_power_throttling(
+            c"SetProcessInformation",
+            GetCurrentProcess(),
+            ProcessPowerThrottling as u32,
+        )
+    }
+}
+
+#[cfg(windows)]
 fn favour() -> bool {
     use windows_sys::Win32::System::Threading::{
         GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
     };
+    let _ = disable_thread_power_throttling();
     // SAFETY: GetCurrentThread's pseudo handle needs no closing.
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) != 0 }
 }
@@ -524,18 +711,29 @@ pub fn heap_tag(name: &'static str) -> Option<heap_census::Tag> {
     HEAP_CENSUS.then(|| heap_census::tag(name))
 }
 
-/// `mi_option_purge_delay` in mimalloc.h (index 15 in v2 and v3); the bindings
-/// don't name it.
+/// `mi_option_e` indices in mimalloc v3 (`mimalloc.h` lines 437-478); the bindings
+/// don't name them.
+const PURGE_DECOMMITS: libmimalloc_sys::mi_option_t = 5;
 const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+const ARENA_PURGE_MULT: libmimalloc_sys::mi_option_t = 24;
+const PAGE_FULL_RETAIN: libmimalloc_sys::mi_option_t = 36;
 
-/// Set the allocator up, first thing in `main`: free pages go back to the OS
-/// at once instead of a second later. With mimalloc's delay the game held a
-/// quarter more memory than with the system heap; without it a few percent,
-/// and generation keeps most of its speed-up.
+/// Set the allocator up, first thing in `main`: free pages decommit back to the OS
+/// at once instead of a second later, and idle worker heaps retain no extra full
+/// small pages. With mimalloc's delay the game held a quarter more memory than
+/// with the system heap; without it a few percent, and generation keeps most of
+/// its speed-up.
 pub fn configure_allocator() {
-    // SAFETY: sets one integer option, which mimalloc reads at each purge.
+    // SAFETY: sets integer options, which mimalloc reads at each purge and page retirement.
     unsafe {
+        libmimalloc_sys::mi_option_set(PURGE_DECOMMITS, 1);
         libmimalloc_sys::mi_option_set(PURGE_DELAY, 0);
+        libmimalloc_sys::mi_option_set(ARENA_PURGE_MULT, 1);
+        libmimalloc_sys::mi_option_set(PAGE_FULL_RETAIN, 0);
+    }
+    #[cfg(windows)]
+    {
+        let _ = disable_process_power_throttling();
     }
 }
 
@@ -602,7 +800,52 @@ fn release() {
     }
 }
 
-#[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_vendor = "apple")))]
+#[cfg(windows)]
+fn compact_windows_process_heaps() -> usize {
+    use std::ffi::c_void;
+    type GetProcessHeapsFn = unsafe extern "system" fn(u32, *mut *mut c_void) -> u32;
+    type HeapCompactFn = unsafe extern "system" fn(*mut c_void, u32) -> usize;
+
+    let (Some(get_heaps_ptr), Some(compact_ptr)) = (
+        kernel32_proc(c"GetProcessHeaps"),
+        kernel32_proc(c"HeapCompact"),
+    ) else {
+        return 0;
+    };
+    // SAFETY: `get_heaps_ptr` and `compact_ptr` were resolved from `kernel32.dll`
+    // for `GetProcessHeaps` and `HeapCompact` with matching Win32 system ABI signatures.
+    let (get_process_heaps, heap_compact) = unsafe {
+        (
+            std::mem::transmute::<*mut c_void, GetProcessHeapsFn>(get_heaps_ptr),
+            std::mem::transmute::<*mut c_void, HeapCompactFn>(compact_ptr),
+        )
+    };
+
+    let mut heaps = [std::ptr::null_mut(); 64];
+    // SAFETY: `heaps` has room for `heaps.len()` handles and is writable.
+    let count = unsafe { get_process_heaps(heaps.len() as u32, heaps.as_mut_ptr()) };
+    let limit = (count as usize).min(heaps.len());
+    let mut compacted = 0usize;
+    for &heap in &heaps[..limit] {
+        if !heap.is_null() {
+            // SAFETY: `heap` is an active process heap handle returned by `GetProcessHeaps`.
+            let _ = unsafe { heap_compact(heap, 0) };
+            compacted += 1;
+        }
+    }
+    compacted
+}
+
+#[cfg(windows)]
+fn release() {
+    let _ = compact_windows_process_heaps();
+}
+
+#[cfg(not(any(
+    all(target_os = "linux", target_env = "gnu"),
+    target_vendor = "apple",
+    windows
+)))]
 fn release() {}
 
 /// The REPARSE_DATA_BUFFER of a mount point naming `name` (UTF-16, `\??\` prefixed). The length
@@ -735,12 +978,15 @@ mod tests {
         assert_eq!(workers_for(2, || Some(1)), 1);
     }
 
-    /// Platforms without asymmetric core detection (Windows, etc.) are unchanged: the count is the one the pool always had.
+    /// Platforms without asymmetric core detection are unchanged: the count is the one the pool always had.
     #[test]
     fn default_workers_are_unchanged_on_uniform_systems() {
         let before = super::worker_count().saturating_sub(1).max(1);
-        if cfg!(any(target_vendor = "apple", target_os = "linux")) {
+        if cfg!(any(target_vendor = "apple", target_os = "linux", windows)) {
             assert!((1..=before).contains(&super::default_workers()));
+            if super::performance_cores().is_none() {
+                assert_eq!(super::default_workers(), before);
+            }
         } else {
             assert_eq!(super::performance_cores(), None);
             assert_eq!(super::default_workers(), before);
@@ -857,17 +1103,21 @@ mod tests {
         .unwrap();
     }
 
-    /// The option set is the purge delay: mimalloc v3's default for it is
-    /// 1000 ms, and it is 0 once configured.
+    /// The options set configure immediate physical page decommit and zero idle
+    /// full-page retention: mimalloc v3's default purge delay is 1000 ms, and it
+    /// is 0 once configured.
     #[test]
     fn configuring_the_allocator_purges_at_once() {
-        // SAFETY: reads and sets one integer option.
-        let get = || unsafe { libmimalloc_sys::mi_option_get(super::PURGE_DELAY) };
+        // SAFETY: reads and sets integer options.
+        let get = |opt| unsafe { libmimalloc_sys::mi_option_get(opt) };
         if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
-            assert_eq!(get(), 1000);
+            assert_eq!(get(super::PURGE_DELAY), 1000);
         }
         super::configure_allocator();
-        assert_eq!(get(), 0);
+        assert_eq!(get(super::PURGE_DECOMMITS), 1);
+        assert_eq!(get(super::PURGE_DELAY), 0);
+        assert_eq!(get(super::ARENA_PURGE_MULT), 1);
+        assert_eq!(get(super::PAGE_FULL_RETAIN), 0);
     }
 }
 
@@ -895,5 +1145,77 @@ mod junction_tests {
         assert!(super::mount_point_buffer(&name).is_err());
         assert!(super::mount_point_buffer(&vec![0; 32_768]).is_err());
         assert!(super::mount_point_buffer(&[0; 100]).is_ok());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_hybrid_tests {
+    fn processor_core_record(efficiency_class: u8, mask: usize) -> Vec<u8> {
+        const GROUP_AFFINITY_BYTES: usize = core::mem::size_of::<usize>() + 8;
+        let size = 32 + GROUP_AFFINITY_BYTES;
+        let mut rec = vec![0u8; size];
+        rec[0..4].copy_from_slice(&0u32.to_le_bytes()); // RelationProcessorCore
+        rec[4..8].copy_from_slice(&(size as u32).to_le_bytes());
+        rec[9] = efficiency_class;
+        rec[30..32].copy_from_slice(&1u16.to_le_bytes()); // GroupCount = 1
+        rec[32..32 + core::mem::size_of::<usize>()].copy_from_slice(&mask.to_le_bytes());
+        rec
+    }
+
+    #[test]
+    fn parses_synthetic_hybrid_buffer() {
+        let mut buf = Vec::new();
+        for _ in 0..6 {
+            buf.extend_from_slice(&processor_core_record(1, 0b11));
+        }
+        for _ in 0..8 {
+            buf.extend_from_slice(&processor_core_record(0, 0b1));
+        }
+        assert_eq!(super::parse_windows_performance_cores(&buf), Some(12));
+    }
+
+    #[test]
+    fn ignores_uniform_buffer() {
+        let mut buf = Vec::new();
+        for _ in 0..8 {
+            buf.extend_from_slice(&processor_core_record(0, 0b11));
+        }
+        assert_eq!(super::parse_windows_performance_cores(&buf), None);
+    }
+
+    #[test]
+    fn handles_empty_and_truncated_buffers_without_panicking() {
+        assert_eq!(super::parse_windows_performance_cores(&[]), None);
+        assert_eq!(super::parse_windows_performance_cores(&[0u8; 4]), None);
+
+        let full = processor_core_record(1, 0b11);
+        for len in 0..full.len() {
+            assert_eq!(super::parse_windows_performance_cores(&full[..len]), None);
+        }
+
+        // Record claiming GroupCount = 1 without room for GROUP_AFFINITY.
+        let mut short_group = vec![0u8; 32];
+        short_group[0..4].copy_from_slice(&0u32.to_le_bytes());
+        short_group[4..8].copy_from_slice(&32u32.to_le_bytes());
+        short_group[9] = 1;
+        short_group[30..32].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(super::parse_windows_performance_cores(&short_group), None);
+
+        // Record with size < 8 must stop instead of looping.
+        let mut bad_size = [0u8; 16];
+        bad_size[4..8].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(super::parse_windows_performance_cores(&bad_size), None);
+    }
+
+    #[test]
+    fn power_throttling_calls_complete_cleanly() {
+        let _ = super::disable_thread_power_throttling();
+        let _ = super::disable_process_power_throttling();
+    }
+
+    #[test]
+    fn compact_windows_process_heaps_compacts_at_least_default_heap() {
+        use super::compact_windows_process_heaps;
+        assert!(compact_windows_process_heaps() >= 1);
     }
 }

@@ -1,3 +1,8 @@
+> **🦀 Nhánh Đa Phiên Bản & Siêu Nhẹ `blockway-rust-engine` (`v2.1.0` — dành cho [BlockWay Launcher v42.4.0 PRO](https://github.com/buiduchuy2010qn-prog/blockway-launcher)):**
+> Bản mở rộng độc lập phát triển dựa trên nền tảng mã nguồn mở **[horizon-rust/horizon](https://github.com/horizon-rust/horizon)** (`Copyright (c) 2026 Ludovic Marie and the Horizon contributors`, **[MIT License](LICENSE)**).
+> - **Điểm nâng cấp mới (`v2.1.0`):** Hỗ trợ 29 phiên bản `1.16.5 → 26.3` (`--mc-version`), nén RAM Windows `HeapCompact` + `mimalloc` v3 Zero-Retain, ưu tiên nhân `P-Core` / tắt `EcoQoS`, stack luồng `1 MiB` và bộ chuyển đổi Mod/Datapack `26.3` (`horizon-port-jar`). Xem chi tiết tại **[BLOCKWAY_RUST.md](BLOCKWAY_RUST.md)**.
+> - **Bản quyền & Ghi công:** Xem **[LICENSE](LICENSE)**, **[NOTICE.md](NOTICE.md)** và **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**.
+
 <p align="center">
   <img src="docs/media/banner.webp" alt="Horizon: the game you know, rebuilt in Rust" width="100%">
 </p>
